@@ -1,4 +1,5 @@
 #include <sys/mman.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
 #include <sys/time.h>
 #include <sys/types.h>
@@ -17,10 +18,11 @@
 #include <json-c/json_object_iterator.h>
 #include <json-c/json_tokener.h>
 
+const char          program_name[] = PROGNAME;
+const char         *version = VERSION;
 int                 timeout = 300;
 size_t              buf_size = (2 << 12);  /* 8k */
-const char         *prompt = "password1> ";
-char                db_path[PATH_MAX + 1] = "~/.password1.gpg";
+char                db_path[PATH_MAX + 1];
 char                key_id[LINE_MAX + 1] = "";
 struct json_object *db;
 const char         *fields[] = {
@@ -39,7 +41,10 @@ const char *paste_cmd = "/usr/bin/xclip -l 1";
 void
 print_help()
 {
-	printf("Usage: password1 [-k <key id>] [-f <db path>] [-t <timeout>] [-h]\n");
+	// TODO: add version flag, defined from the Makefile
+	// TODO: better help
+	printf("Usage: %s [-n] [-k <key id>] [-f <db path>] "
+	    "[-t <timeout>] [-h]\n", program_name);
 }
 
 void
@@ -515,6 +520,17 @@ reset_timer()
 		err(1, "setitimer");
 }
 
+void
+handle_segv(int unused)
+{
+	struct rusage ru;
+
+	warn("segfault");
+	warnx("Probably ran out of memory during JSON parsing");
+	getrusage(RUSAGE_SELF, &ru);
+	errx(1, "Current memory usage: %ld kb", ru.ru_maxrss);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -523,13 +539,20 @@ main(int argc, char **argv)
 	char *token;
 	int   quit = 0;
 	int   modified = 0;
+	int   no_mlock = 0;
+	char  prompt[sizeof(program_name) + 2];
 
 	struct sigaction act, oact;
 
+	// TODO: check the returned length
+	snprintf(prompt, sizeof(prompt), "%s> ", program_name);
+	snprintf(db_path, sizeof(db_path), "%s/.%s.json.gpg",
+	    getenv("HOME"), program_name);
 
 	// TODO: implement timer (SIGALRM?)
 	// TODO: better signal handling, show message. Block signals instead
 	// of ignore? Ignore sigchild?
+
 
 	act.sa_handler = SIG_IGN;
 	sigemptyset(&act.sa_mask);
@@ -539,8 +562,20 @@ main(int argc, char **argv)
 		err(1, "sigaction");
 	}
 
-	while ((opt = getopt(argc, argv, "hf:t:k:")) != -1) {
+	// Catch SIGSEGV as well until we find a better json lib that let's
+	// us manage memory ourselves.
+	act.sa_handler = &handle_segv;
+	sigemptyset(&act.sa_mask);
+	act.sa_flags = 0;
+	if (sigaction(SIGSEGV, &act, &oact) == -1) {
+		err(1, "sigaction");
+	}
+
+	while ((opt = getopt(argc, argv, "hf:t:k:nv")) != -1) {
 		switch (opt) {
+		case 'n':
+			no_mlock = 1;
+			break;
 		case 'k':
 			strncpy(key_id, optarg, sizeof(key_id) - 1);
 			break;
@@ -553,6 +588,9 @@ main(int argc, char **argv)
 		case 'f':
 			strncpy(db_path, optarg, sizeof(db_path) - 1);
 			break;
+		case 'v':
+			printf("%s version %s\n", PROGNAME, VERSION);
+			exit(0);
 		}
 	}
 
@@ -561,7 +599,7 @@ main(int argc, char **argv)
 
 	reset_timer();
 
-	if (mlockall(MCL_FUTURE) == -1) {
+	if (!no_mlock && mlockall(MCL_FUTURE) == -1) {
 		if (errno == ENOMEM) {
 			warnx("Could not lock database in RAM; "
 			    "contents might be swapped to disk");
@@ -655,6 +693,7 @@ again:
 		wipe_mem(line, strlen(line) + 1);
 	}
 
+	// TODO: need to find a way to wipe_mem() here too
 	json_object_put(db);
 
 	printf("Bye.\n");
