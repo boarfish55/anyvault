@@ -1,10 +1,12 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/time.h>
 #include <sys/types.h>
 #include <fcntl.h>
 #include <err.h>
 #include <errno.h>
 #include <limits.h>
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <termios.h>
@@ -15,6 +17,7 @@
 #include <json-c/json_object_iterator.h>
 #include <json-c/json_tokener.h>
 
+int                 timeout = 300;
 size_t              buf_size = (2 << 12);  /* 8k */
 const char         *prompt = "password1> ";
 char                db_path[PATH_MAX + 1] = "~/.password1.gpg";
@@ -27,13 +30,15 @@ const char         *fields[] = {
 	NULL
 };
 
+
 const char *encrypt_cmd = "/usr/bin/gpg -c --cipher-algo AES-256 -o %s -";
 const char *decrypt_cmd = "/usr/bin/gpg --decrypt %s";
+const char *paste_cmd = "/usr/bin/xclip -l 1";
 
 void
 print_help()
 {
-	printf("Usage: password1 [-f <db path>] [-h]\n");
+	printf("Usage: password1 [-f <db path>] [-t <timeout>] [-h]\n");
 }
 
 void
@@ -77,24 +82,36 @@ err:
 void
 load_db()
 {
-	FILE                   *db_file;
+	FILE                   *cmd_fd;
+	char                    cmd[PATH_MAX + 1];
 	size_t                  r;
 	size_t                  pos = 0;
         char                   *buf;
 	enum json_tokener_error error;
+	int                     st;
 
-	// TODO: decrypt command
+	if (access(db_path, F_OK) == -1) {
+		warnx("database %s does not exist; will create", db_path);
+		return;
+	}
 
-	db_file = fopen(db_path, "r");
-	if (db_file == NULL)
-		err(1, "fopen: %s", db_path);
+	if (access(db_path, R_OK) == -1)
+		err(1, "cannot access database %s; "
+		    "make sure it is readable", db_path);
+
+	if (snprintf(cmd, sizeof(cmd), decrypt_cmd, db_path) >= sizeof(cmd))
+		errx(1, "cannot decrypt; command too long");
+
+	cmd_fd = popen(cmd, "r");
+	if (cmd_fd == NULL)
+		err(1, "cannot decrypt; popen");
 
 	buf = malloc(buf_size);
 	if (buf == NULL)
 		mem_err(buf_size);
 
 	for (;;) {
-		r = fread(buf + pos, 1, buf_size - pos, db_file);
+		r = fread(buf + pos, 1, buf_size - pos, cmd_fd);
 		if (r == 0)
 			break;
 
@@ -107,42 +124,99 @@ load_db()
 		}
 	}
 
-	if (ferror(db_file))
+	if (ferror(cmd_fd))
 		err(1, "fread");
-
-	if (fclose(db_file) != 0)
-		errx(1, "could not properly close file: %s", db_path);
 
 	db = json_tokener_parse_verbose(buf, &error);
 	if (db == NULL)
 		errx(1, "error: %s\n", json_tokener_error_desc(error));
 	wipe_mem(buf, buf_size);
+
+	st = pclose(cmd_fd);
+	switch (st) {
+	case -1:
+		err(1, "popen");
+	case 0:
+		break;
+	default:
+		errx(1, "decrypt command failed with code %d: %s",
+		    st, db_path);
+	}
 }
 
 void
 save_db()
 {
-	FILE       *db_file;
+	FILE       *cmd_fd;
+	char        cmd[PATH_MAX + 1];
+	char        tmp_db_path[PATH_MAX + 1];
+	int         tmp_fd;
 	size_t      w;
 	const char *buf;
+	int         st;
 
-	// TODO: encrypt command
+	umask(0077);
 
-	db_file = fopen(db_path, "w");
-	if (db_file == NULL)
-		warn("fopen: %s", db_path);
+	if (snprintf(tmp_db_path, sizeof(tmp_db_path), "%s.XXXXXX", db_path)
+	    >= sizeof(tmp_db_path)) {
+		warnx("cannot encrypt; db path too long");
+		return;
+	}
+
+	tmp_fd = mkstemp(tmp_db_path);
+	if (tmp_fd == -1) {
+		warn("could not save database; mkstemp");
+		return;
+	}
+
+	if (close(tmp_fd) == -1) {
+		warn("could not save database; close");
+		return;
+	}
+
+	if (snprintf(cmd, sizeof(cmd), encrypt_cmd, tmp_db_path)
+	    >= sizeof(cmd)) {
+		warnx("cannot encrypt; command too long");
+		unlink(tmp_db_path);
+		return;
+	}
+
+	cmd_fd = popen(cmd, "w");
+	if (cmd_fd == NULL) {
+		warn("cannot encrypt; popen");
+		unlink(tmp_db_path);
+		return;
+	}
 
 	buf = json_object_to_json_string_ext(db,
 	    JSON_C_TO_STRING_SPACED | JSON_C_TO_STRING_PRETTY);
-	if (buf == NULL || *buf == '\0')
+	if (buf == NULL || *buf == '\0') {
 		warn("could not prepare JSON output");
+		unlink(tmp_db_path);
+		pclose(cmd_fd);
+		return;
+	}
 
-	w = fwrite(buf, 1, strlen(buf), db_file);
-	if (w < strlen(buf))
+	w = fwrite(buf, 1, strlen(buf), cmd_fd);
+	if (w < strlen(buf)) {
 		warn("failed to write DB; write count: %lu", w);
+		unlink(tmp_db_path);
+		pclose(cmd_fd);
+		return;
+	}
 
-	if (fclose(db_file) != 0)
+	st = pclose(cmd_fd);
+	switch (st) {
+	case -1:
 		warn("could not properly close file: %s", db_path);
+	case 0:
+		break;
+	default:
+		warnx("encrypt command failed with code %d: %s", st, db_path);
+	}
+
+	if (rename(tmp_db_path, db_path) == -1)
+		warn("count not rename %s to %s", tmp_db_path, db_path);
 }
 
 struct json_object *
@@ -231,16 +305,40 @@ void
 paste(struct json_object *obj)
 {
 	struct json_object  *v;
+	FILE                *cmd_fd;
+	const char          *secret;
+	size_t               w;
 
 	if (obj == NULL) {
 		printf("secret not found\n");
 		return;
 	}
 
-	if (json_object_object_get_ex(obj, "secret", &v))
-		printf("%s", json_object_get_string(v));
+	cmd_fd = popen(paste_cmd, "w");
+	if (cmd_fd == NULL) {
+		warn("cannot paste; popen");
+		return;
+	}
 
-	// TODO ... send to 'xclip -l 1'
+	if (!json_object_object_get_ex(obj, "secret", &v)) {
+		warnx("could not get secret");
+		pclose(cmd_fd);
+		return;
+	}
+	secret = json_object_get_string(v);
+
+	w = fwrite(secret, 1, strlen(secret), cmd_fd);
+	if (w < strlen(secret))
+		warn("failed to write to paste command; write count: %lu", w);
+
+	switch (pclose(cmd_fd)) {
+	case -1:
+		warn("paste command failed");
+	case 0:
+		break;
+	default:
+		warnx("paste command failed");
+	}
 }
 
 char *
@@ -289,9 +387,24 @@ add_secret(const char *key, int overwrite)
 		return;
 	}
 
-	s = json_object_new_object();
+	if (!overwrite) {
+		s = json_object_new_object();
+	} else {
+		if (!json_object_object_get_ex(get_secrets(), key, &s)) {
+			printf("couldn't get secret %s\n", key);
+			return;
+		}
+	}
 
 	for (f = fields; *f; f++) {
+		if (overwrite) {
+			printf("Change %s ? [n]", *f);
+			input = read_field("", 1);
+			if (toupper(*input) != 'Y') {
+				free(input);
+				continue;
+			}
+		}
 		if (strcmp(*f, "secret") == 0) {
 			for (;;) {
 				input = read_field("secret", 0);
@@ -303,6 +416,10 @@ add_secret(const char *key, int overwrite)
 		} else {
 			input = read_field(*f, 1);
 		}
+
+		if (overwrite)
+			json_object_object_del(s, *f);
+
 		json_object_object_add(s, *f, json_object_new_string(input));
 		wipe_mem(input, strlen(input) + 1);
 	}
@@ -330,10 +447,9 @@ add_secret(const char *key, int overwrite)
 		break;
 	}
 
-	if (overwrite)
-		json_object_object_del(get_secrets(), key);
+	if (!overwrite)
+		json_object_object_add(get_secrets(), key, s);
 
-	json_object_object_add(get_secrets(), key, s);
 
 	if (overwrite)
 		printf("Changed %s\n", key);
@@ -365,6 +481,23 @@ delete_secret(const char *key)
 	printf("Deleted %s\n", key);
 }
 
+void
+reset_timer()
+{
+	struct itimerval exit_timer;
+
+	memset(&exit_timer, 0, sizeof(exit_timer));
+
+	if (gettimeofday(&exit_timer.it_value, NULL) == -1)
+		err(1, "gettimeofday");
+
+	exit_timer.it_value.tv_sec += timeout;
+
+	// Uh??
+	if (setitimer(ITIMER_REAL, &exit_timer, NULL) == -1)
+		err(1, "setitimer");
+}
+
 int
 main(int argc, char **argv)
 {
@@ -372,13 +505,28 @@ main(int argc, char **argv)
 	char *line = NULL;
 	char *token;
 	int   quit = 0;
+	int   modified = 0;
 
-	// TODO: signal handlers!!!
+	struct sigaction act, oact;
+
 
 	// TODO: implement timer (SIGALRM?)
+	// TODO: better signal handling, show message. Block signals instead
+	// of ignore? Ignore sigchild?
 
-	while ((opt = getopt(argc, argv, "hf:")) != -1) {
+	act.sa_handler = SIG_IGN;
+	sigemptyset(&act.sa_mask);
+	act.sa_flags = 0;
+	if (sigaction(SIGINT, &act, &oact) == -1
+	    || sigaction(SIGQUIT, &act, &oact) == -1) {
+		err(1, "sigaction");
+	}
+
+	while ((opt = getopt(argc, argv, "hf:t:")) != -1) {
 		switch (opt) {
+		case 't':
+			timeout = atoi(optarg);
+			break;
 		case 'h':
 			print_help();
 			exit(0);
@@ -387,6 +535,8 @@ main(int argc, char **argv)
 			break;
 		}
 	}
+
+	reset_timer();
 
 	if (mlockall(MCL_FUTURE) == -1) {
 		if (errno == ENOMEM) {
@@ -402,8 +552,15 @@ main(int argc, char **argv)
 
 	while (!quit) {
 		line = readline(prompt);
-		if (line == NULL)
-			break;
+		reset_timer();
+		if (line == NULL) {
+			if (modified) {
+				printf("Changes were made; either save or "
+				    "use quit\n");
+				continue;
+			} else
+				break;
+		}
 
 		if (*line)
 			add_history(line);
@@ -419,6 +576,7 @@ main(int argc, char **argv)
 				goto again;
 			}
 			add_secret(token, 0);
+			modified = 1;
 		} else if (strcmp(token, "change") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
@@ -426,6 +584,7 @@ main(int argc, char **argv)
 				goto again;
 			}
 			add_secret(token, 1);
+			modified = 1;
 		} else if (strcmp(token, "delete") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
@@ -433,6 +592,7 @@ main(int argc, char **argv)
 				goto again;
 			}
 			delete_secret(token);
+			modified = 1;
 		} else if (strcmp(token, "help") == 0) {
 			printf("Help: add, change, delete, help, list, paste, quit, save, show, showall\n");
 		} else if (strcmp(token, "list") == 0) {
@@ -443,10 +603,18 @@ main(int argc, char **argv)
 				goto again;
 			paste(find_secret(token));
 		} else if (strcmp(token, "quit") == 0) {
-			quit = 1;
-			// TODO: save reminder?
+			if (modified) {
+				token = read_field("Changes were made; "
+				    "exit without saving? [y/N]", 1);
+				if (toupper(*token) == 'Y')
+					quit = 1;
+				free(token);
+			} else {
+				quit = 1;
+			}
 		} else if (strcmp(token, "save") == 0) {
 			save_db();
+			modified = 0;
 		} else if (strcmp(token, "showall") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL)
