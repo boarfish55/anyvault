@@ -1,10 +1,15 @@
-all: secrets
+PROGNAME=secrets
+VERSION=1.0
 
-secrets: secrets.c
-	gcc secrets.c -g -o secrets \
+all: $(PROGNAME)
+
+$(PROGNAME): $(PROGNAME).c
+	gcc -DPROGNAME=\"$(PROGNAME)\" \
+		-DVERSION=\"$(VERSION)\" \
+		$(PROGNAME).c -g -o $(PROGNAME) \
 		`pkg-config --libs 'json-c >= 0.12.1'` \
 		-lreadline \
 		-Wall
 
 clean:
-	rm -f secrets *.o
+	rm -f $(PROGNAME) *.o
