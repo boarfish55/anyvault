@@ -21,6 +21,7 @@ int                 timeout = 300;
 size_t              buf_size = (2 << 12);  /* 8k */
 const char         *prompt = "password1> ";
 char                db_path[PATH_MAX + 1] = "~/.password1.gpg";
+char                key_id[LINE_MAX + 1] = "";
 struct json_object *db;
 const char         *fields[] = {
 	"notes",
@@ -31,14 +32,14 @@ const char         *fields[] = {
 };
 
 
-const char *encrypt_cmd = "/usr/bin/gpg -c --cipher-algo AES-256 -o %s -";
+const char *encrypt_cmd = "/usr/bin/gpg --yes -se -r %s -o %s -";
 const char *decrypt_cmd = "/usr/bin/gpg --decrypt %s";
 const char *paste_cmd = "/usr/bin/xclip -l 1";
 
 void
 print_help()
 {
-	printf("Usage: password1 [-f <db path>] [-t <timeout>] [-h]\n");
+	printf("Usage: password1 [-k <key id>] [-f <db path>] [-t <timeout>] [-h]\n");
 }
 
 void
@@ -140,7 +141,7 @@ load_db()
 		break;
 	default:
 		errx(1, "decrypt command failed with code %d: %s",
-		    st, db_path);
+		    st, cmd);
 	}
 }
 
@@ -154,6 +155,7 @@ save_db()
 	size_t      w;
 	const char *buf;
 	int         st;
+	const char *tty;
 
 	umask(0077);
 
@@ -174,9 +176,22 @@ save_db()
 		return;
 	}
 
-	if (snprintf(cmd, sizeof(cmd), encrypt_cmd, tmp_db_path)
+	if (snprintf(cmd, sizeof(cmd), encrypt_cmd, key_id, tmp_db_path)
 	    >= sizeof(cmd)) {
 		warnx("cannot encrypt; command too long");
+		unlink(tmp_db_path);
+		return;
+	}
+
+	// TODO: might need a better way to do this ...
+	tty = ttyname(0);
+	if (tty == NULL) {
+		warn("ttyname");
+		unlink(tmp_db_path);
+		return;
+	}
+	if (setenv("GPG_TTY", tty, 1) == -1) {
+		warn("could not set GPG_TTY");
 		unlink(tmp_db_path);
 		return;
 	}
@@ -209,10 +224,12 @@ save_db()
 	switch (st) {
 	case -1:
 		warn("could not properly close file: %s", db_path);
+		return;
 	case 0:
 		break;
 	default:
-		warnx("encrypt command failed with code %d: %s", st, db_path);
+		warnx("encrypt command failed with code %d: '%s'", st, cmd);
+		return;
 	}
 
 	if (rename(tmp_db_path, db_path) == -1)
@@ -522,8 +539,11 @@ main(int argc, char **argv)
 		err(1, "sigaction");
 	}
 
-	while ((opt = getopt(argc, argv, "hf:t:")) != -1) {
+	while ((opt = getopt(argc, argv, "hf:t:k:")) != -1) {
 		switch (opt) {
+		case 'k':
+			strncpy(key_id, optarg, sizeof(key_id) - 1);
+			break;
 		case 't':
 			timeout = atoi(optarg);
 			break;
@@ -531,10 +551,13 @@ main(int argc, char **argv)
 			print_help();
 			exit(0);
 		case 'f':
-			strncpy(db_path, optarg, sizeof(db_path) -1);
+			strncpy(db_path, optarg, sizeof(db_path) - 1);
 			break;
 		}
 	}
+
+	if (*key_id == '\0')
+		errx(1, "key_id cannot be empty; use -k");
 
 	reset_timer();
 
