@@ -55,6 +55,13 @@ mem_err(size_t n)
 }
 
 void
+mem_warn(size_t n)
+{
+	warnx("couldn't allocate %lu bytes; "
+	    "check your ulimit for locked memory", n);
+}
+
+void
 wipe_mem(void *buf, size_t len)
 {
 	int      fd;
@@ -258,7 +265,7 @@ cmp_key(const void *p1, const void *p2)
 }
 
 void
-list_secrets()
+list_secrets(const char *pattern)
 {
 	struct json_object_iterator   i;
 	struct json_object_iterator   il;
@@ -266,22 +273,37 @@ list_secrets()
 	size_t                        n_keys;
 	size_t                        n_keys_max = buf_size / 128;
 	const char                  **keys;
+	const char                   *name;
 
 	keys = malloc(n_keys_max * sizeof(char *));
-	if (keys == NULL)
-		mem_err(n_keys_max * sizeof(char *));
+	if (keys == NULL) {
+		mem_warn(n_keys_max * sizeof(char *));
+		return;
+	}
 
 	for (n_keys = 0, i = json_object_iter_begin(get_secrets()),
 	    il = json_object_iter_end(get_secrets());
-	    !json_object_iter_equal(&i, &il);
-	    n_keys++, json_object_iter_next(&i)) {
+	    !json_object_iter_equal(&i, &il); json_object_iter_next(&i)) {
 		if (n_keys > n_keys_max) {
+			keys = realloc(keys, n_keys_max * 2 * sizeof(char *));
+			if (keys == NULL) {
+				mem_warn(n_keys_max * 2 * sizeof(char *));
+				goto end;
+			}
 			n_keys_max *= 2;
-			keys = realloc(keys, n_keys_max * sizeof(char *));
-			if (keys == NULL)
-				mem_err(n_keys_max * sizeof(char *));
 		}
-		keys[n_keys] = json_object_iter_peek_name(&i);
+		name = json_object_iter_peek_name(&i);
+		// TODO: very crude prefix matching. Maybe something similar
+		// to glob() might be better?
+		if (pattern) {
+			if (strncmp(name, pattern, strlen(pattern)) == 0) {
+				keys[n_keys] = name;
+				n_keys++;
+			}
+		} else {
+			keys[n_keys] = name;
+			n_keys++;
+		}
 	}
 
 	qsort(keys, n_keys, sizeof(char *), cmp_key);
@@ -290,6 +312,7 @@ list_secrets()
 		printf("%s\n", keys[key]);
 	}
 
+end:
 	wipe_mem(keys, n_keys_max * sizeof(char *));
 }
 
@@ -657,7 +680,8 @@ main(int argc, char **argv)
 		} else if (strcmp(token, "help") == 0) {
 			printf("Help: add, change, delete, help, list, paste, quit, save, show, showall\n");
 		} else if (strcmp(token, "list") == 0) {
-			list_secrets();
+			token = strtok(NULL, " ");
+			list_secrets(token);
 		} else if (strcmp(token, "paste") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL)
