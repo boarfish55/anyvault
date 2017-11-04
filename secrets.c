@@ -293,10 +293,8 @@ list_secrets(const char *pattern)
 			n_keys_max *= 2;
 		}
 		name = json_object_iter_peek_name(&i);
-		// TODO: very crude prefix matching. Maybe something similar
-		// to glob() might be better?
 		if (pattern) {
-			if (strncmp(name, pattern, strlen(pattern)) == 0) {
+			if (strstr(name, pattern)) {
 				keys[n_keys] = name;
 				n_keys++;
 			}
