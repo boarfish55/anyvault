@@ -38,6 +38,11 @@ const char *encrypt_cmd = "/usr/bin/gpg --yes -se -r %s -o %s -";
 const char *decrypt_cmd = "/usr/bin/gpg --decrypt %s";
 const char *paste_cmd = "/usr/bin/xclip -l 1";
 
+// TODO: use jasson JSON library, which allows custom malloc/free,
+// and might properly return errors on alloc, and plug in mlock() in
+// there directly instead of using mlockall().
+// => libjansson-dev
+
 void
 print_help()
 {
@@ -87,7 +92,7 @@ wipe_mem(void *buf, size_t len)
 	free(buf);
 	return;
 err:
-	warnx("cannot wipe uffer at address %p", buf);
+	warnx("cannot wipe buffer at address %p", buf);
 	close(fd);
 	free(buf);
 }
@@ -546,10 +551,12 @@ handle_segv(int unused)
 {
 	struct rusage ru;
 
-	warn("segfault");
-	warnx("Probably ran out of memory during JSON parsing");
+	// TODO: once we change to a better json lib, we might not need
+	// this probably explanation text.
+	warnx("caught SIGSEGV; "
+	    "probably ran out of memory during JSON parsing");
 	getrusage(RUSAGE_SELF, &ru);
-	errx(1, "Current memory usage: %ld kb", ru.ru_maxrss);
+	errx(1, "current memory usage: %ld kb", ru.ru_maxrss);
 }
 
 int
