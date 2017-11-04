@@ -34,6 +34,9 @@ const char         *fields[] = {
 };
 
 
+// TODO: those should be config file options.
+// Upon opening the config flag, we should make sure it is mode 0600,
+// and owned by the caller. Same for the secrets database.
 const char *encrypt_cmd = "/usr/bin/gpg --yes -se -r %s -o %s -";
 const char *decrypt_cmd = "/usr/bin/gpg --decrypt %s";
 const char *paste_cmd = "/usr/bin/xclip -l 1";
@@ -172,7 +175,6 @@ save_db()
 	size_t      w;
 	const char *buf;
 	int         st;
-	const char *tty;
 
 	umask(0077);
 
@@ -196,19 +198,6 @@ save_db()
 	if (snprintf(cmd, sizeof(cmd), encrypt_cmd, key_id, tmp_db_path)
 	    >= sizeof(cmd)) {
 		warnx("cannot encrypt; command too long");
-		unlink(tmp_db_path);
-		return;
-	}
-
-	// TODO: might need a better way to do this ...
-	tty = ttyname(0);
-	if (tty == NULL) {
-		warn("ttyname");
-		unlink(tmp_db_path);
-		return;
-	}
-	if (setenv("GPG_TTY", tty, 1) == -1) {
-		warn("could not set GPG_TTY");
 		unlink(tmp_db_path);
 		return;
 	}
