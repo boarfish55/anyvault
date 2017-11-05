@@ -7,7 +7,7 @@ $(PROGNAME): $(PROGNAME).c
 	gcc -DPROGNAME=\"$(PROGNAME)\" \
 		-DVERSION=\"$(VERSION)\" \
 		$(PROGNAME).c -g -o $(PROGNAME) \
-		`pkg-config --libs 'json-c >= 0.12.1'` \
+		`pkg-config --libs 'jansson >= 2.9'` \
 		-lreadline \
 		-Wall
 
