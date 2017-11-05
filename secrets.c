@@ -22,6 +22,7 @@ const char         *version = VERSION;
 
 char                cfg_path[PATH_MAX + 1];
 char                db_path[PATH_MAX + 1];
+char                bk_db_path[PATH_MAX + 1];
 int                 timeout = 300;
 size_t              max_value_length = 2048;
 int                 no_mlock = 0;
@@ -226,6 +227,10 @@ read_cfg()
 			if (snprintf(db_path, sizeof(db_path), "%s", v)
 			    >= sizeof(db_path))
 				warnx("value of %s was truncated", p);
+		} else if (strcmp(p, "backup_db_path") == 0) {
+			if (snprintf(bk_db_path, sizeof(bk_db_path), "%s", v)
+			    >= sizeof(bk_db_path))
+				warnx("value of %s was truncated", p);
 		} else if (strcmp(p, "timeout") == 0) {
 			if (atoi(v) < 0)
 				warnx("invalid timeout specified");
@@ -349,7 +354,8 @@ save_db()
 		return;
 	}
 
-	warnx("created tmp save file: %s", tmp_db_path);
+	if (debug_level)
+		warnx("created tmp save file: %s", tmp_db_path);
 
 	if (snprintf(cmd, sizeof(cmd), "%s", encrypt_cmd) >= sizeof(cmd)) {
 		warnx("encryption command was truncated; exiting");
@@ -393,8 +399,13 @@ save_db()
 		return;
 	}
 
+	if (debug_level)
+		warnx("backuping up before saving: %s", bk_db_path);
+	if (rename(db_path, bk_db_path) == -1)
+		warn("could not rename %s to %s", db_path, bk_db_path);
+
 	if (rename(tmp_db_path, db_path) == -1)
-		warn("count not rename %s to %s", tmp_db_path, db_path);
+		warn("could not rename %s to %s", tmp_db_path, db_path);
 
 	if (debug_level)
 		warnx("successfully saved; renaming %s to %s",
@@ -731,6 +742,10 @@ main(int argc, char **argv)
 	if (snprintf(db_path, sizeof(db_path), "%s/.%s.json.gpg",
 	    getenv("HOME"), program_name) >= sizeof(db_path))
 		errx(1, "db path is too long");
+
+	if (snprintf(bk_db_path, sizeof(bk_db_path), "%s~",
+	    db_path) >= sizeof(bk_db_path))
+		errx(1, "backup db path is too long");
 
 	if (snprintf(cfg_path, sizeof(cfg_path), "%s/.%s.conf",
 	    getenv("HOME"), program_name) >= sizeof(cfg_path))
