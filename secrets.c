@@ -722,6 +722,7 @@ timeout_exit()
 		warnx("saving database");
 		save_db();
 	}
+	json_object_clear(db);
 	exit(0);
 }
 
