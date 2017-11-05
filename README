@@ -2,7 +2,7 @@ secrets lets you manage a JSON database of passwords using an external
 encryption/decryption command (such as GnuPG).
 
 Dependencies:
-- libjson-c-dev >= 0.12.1
+- libjansson-dev >= 2.9
 - libreadline-dev
 
 To build:

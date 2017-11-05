@@ -10,75 +10,92 @@
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include <termios.h>
 #include <unistd.h>
 #include <readline/readline.h>
 #include <readline/history.h>
-#include <json-c/json.h>
-#include <json-c/json_object_iterator.h>
-#include <json-c/json_tokener.h>
+#include <jansson.h>
 
 const char          program_name[] = PROGNAME;
 const char         *version = VERSION;
-int                 timeout = 300;
-size_t              buf_size = (2 << 12);  /* 8k */
+
+char                cfg_path[PATH_MAX + 1];
 char                db_path[PATH_MAX + 1];
-char                key_id[LINE_MAX + 1] = "";
-struct json_object *db;
-const char         *fields[] = {
-	"notes",
-	"url",
-	"login",
-	"secret",
-	NULL
-};
+int                 timeout = 300;
+size_t              max_value_length = 2048;
+int                 no_mlock = 0;
+int                 debug_level = 0;
 
+int                 db_modified = 0;
+json_t             *db;
+const char         *fields[] = { "notes", "url", "login", "secret", NULL };
 
-// TODO: those should be config file options.
-// Upon opening the config flag, we should make sure it is mode 0600,
-// and owned by the caller. Same for the secrets database.
-const char *encrypt_cmd = "/usr/bin/gpg --yes -se -r %s -o %s -";
-const char *decrypt_cmd = "/usr/bin/gpg --decrypt %s";
-const char *paste_cmd = "/usr/bin/xclip -l 1";
-
-// TODO: use jasson JSON library, which allows custom malloc/free,
-// and might properly return errors on alloc, and plug in mlock() in
-// there directly instead of using mlockall().
-// => libjansson-dev
+char encrypt_cmd[PATH_MAX * 2] = "";
+char decrypt_cmd[PATH_MAX * 2] = "";
+char paste_cmd[PATH_MAX * 2] = "/usr/bin/xclip -l 1";
 
 void
 print_help()
 {
-	// TODO: add version flag, defined from the Makefile
-	// TODO: better help
-	printf("Usage: %s [-n] [-k <key id>] [-f <db path>] "
-	    "[-t <timeout>] [-h]\n", program_name);
+	printf("Usage: %s [options]\n", program_name);
+	printf("\t-h\t\t\tPrint this help\n");
+	printf("\t-v\t\t\tPrint version\n");
+	printf("\t-d\t\t\tIncrease debuggging output\n");
+	printf("\t-c\t<cfg path>\tUse an alternate path for the configuration;\n");
+	printf("\t\t\t\tDefault is %s\n", cfg_path);
 }
 
-void
-mem_err(size_t n)
+/*
+ * Allocates and mlock()'s memory and saves how many bytes are allocatable,
+ * to be used when deallocating to wipe and munlock() the right amount
+ * of memory. Adds an extra sizeof(size_t) at the start of the block.
+ */
+static size_t locked_allocated = 0;
+
+void *
+locked_mem(size_t s)
 {
-	errx(1, "couldn't allocate %lu bytes; "
-	    "check your ulimit for locked memory", n);
+	void *p;
+
+	p = malloc(sizeof(s) + s);
+	if (p == NULL)
+		return NULL;
+
+	*((size_t *)p) = s;
+
+	if (!no_mlock) {
+		if (mlock(p, sizeof(s) + s) == -1) {
+			warn("not allocating %lu bytes; mlock", s);
+			warnx("currently locked: %lu bytes", locked_allocated);
+			free(p);
+			return NULL;
+		}
+		locked_allocated += sizeof(s) + s;
+		if (debug_level >= 2)
+			warnx("current locked memory: %lu bytes",
+			    locked_allocated);
+	}
+
+	return p + sizeof(s);
 }
 
 void
-mem_warn(size_t n)
-{
-	warnx("couldn't allocate %lu bytes; "
-	    "check your ulimit for locked memory", n);
-}
-
-void
-wipe_mem(void *buf, size_t len)
+wipe_mem(void *buf)
 {
 	int      fd;
 	ssize_t  r;
 	size_t   pos;
+	size_t   len;
+	void    *p;
+
+	p = buf - sizeof(len);
+	len = *((size_t *)p);
 
 	if ((fd = open("/dev/urandom", O_RDONLY)) == -1) {
 		warn("could not open /dev/urandom");
-		goto err;
+		warnx("cannot wipe buffer at address %p", buf);
+		goto end;
 	}
 
 	for (pos = 0; pos >= len; pos += r) {
@@ -86,30 +103,179 @@ wipe_mem(void *buf, size_t len)
 		if (r <= 0) {
 			if (errno == EAGAIN)
 				continue;
-			warn("read");
-			goto err;
+			warn("cannot wipe buffer at address %p; read", buf);
+			/* memset() as a fallback */
+			memset(buf, 0, len);
+			goto end;
 		}
 	}
 
+end:
 	close(fd);
-	free(buf);
-	return;
-err:
-	warnx("cannot wipe buffer at address %p", buf);
-	close(fd);
-	free(buf);
+	if (!no_mlock) {
+		if (munlock(p, len) == -1)
+			warn("munlock");
+		else
+			locked_allocated -= len + sizeof(len);
+		if (debug_level >= 2)
+			warnx("current locked memory: %lu bytes",
+			    locked_allocated);
+	}
+	free(p);
+}
+
+int
+str_replace(char *str, size_t max, const char *token, const char *value)
+{
+	char *pos, *end;
+
+	// TODO: this is pretty ugly. Maybe something better with
+	// allocated memory? We should dynamically allocate, and replace
+	// every occurence of the word.
+
+	if (str == NULL || value == NULL)
+		return 1;
+
+	if (token == NULL || (pos = strstr(str, token)) == NULL)
+		return strlen(str);
+
+	if (strlen(str) + strlen(value) - strlen(token) >= max)
+		return 0;
+
+	end = str + strlen(str);
+
+	memmove(pos + strlen(value), pos + strlen(token),
+	    end - (pos + strlen(token)));
+
+	strncpy(pos, value, strlen(value));
+	str[(end - str) + strlen(value) - strlen(token)] = '\0';
+
+	return 1;
+}
+
+void
+read_cfg()
+{
+	char         buf[PATH_MAX + 32];
+	char        *line;
+	int          line_n = 0;
+	FILE        *cfg;
+	int          fd;
+	struct stat  st;
+
+	const char *p, *v;
+
+	fd = open(cfg_path, O_RDONLY);
+	if (fd == -1)
+		err(1, "%s", cfg_path);
+
+	if (fstat(fd, &st) == -1)
+		err(1, "could not stat %s", cfg_path);
+
+	if (st.st_uid != getuid())
+		errx(1, "configuration file ownership is incorrect; "
+		    "you should own it");
+
+	if (st.st_mode & (S_IRWXO|S_IRWXG))
+		errx(1, "configuration file permissions are incorrect; "
+		    "only the owner should have access");
+
+	cfg = fdopen(fd, "r");
+	if (cfg == NULL)
+		err(1, "%s", cfg_path);
+
+	while (fgets(buf, sizeof(buf), cfg)) {
+		line_n++;
+		line = buf;
+
+		while (*line == ' ')
+			line++;
+
+		if (*line == '#' || *line == '\n' || *line == '\0')
+			continue;
+
+		p = strtok(line, ":");
+		if (p == NULL) {
+			warnx("invalid line in configuration: %d", line_n);
+			continue;
+		}
+
+		v = strtok(NULL, "\n");
+		if (v == NULL) {
+			warnx("invalid line in configuration; no value: %d",
+			    line_n);
+			continue;
+		}
+
+		while (*v == ' ')
+			v++;
+
+		if (strcmp(p, "encrypt_cmd") == 0) {
+			if (snprintf(encrypt_cmd, sizeof(encrypt_cmd), "%s", v)
+			    >= sizeof(encrypt_cmd))
+				warnx("value of %s was truncated", p);
+		} else if (strcmp(p, "decrypt_cmd") == 0) {
+			if (snprintf(decrypt_cmd, sizeof(decrypt_cmd), "%s", v)
+			    >= sizeof(decrypt_cmd))
+				warnx("value of %s was truncated", p);
+		} else if (strcmp(p, "paste_cmd") == 0) {
+			if (snprintf(paste_cmd, sizeof(paste_cmd), "%s", v)
+			    >= sizeof(paste_cmd))
+				warnx("value of %s was truncated", p);
+		} else if (strcmp(p, "db_path") == 0) {
+			if (snprintf(db_path, sizeof(db_path), "%s", v)
+			    >= sizeof(db_path))
+				warnx("value of %s was truncated", p);
+		} else if (strcmp(p, "timeout") == 0) {
+			if (atoi(v) < 0)
+				warnx("invalid timeout specified");
+			else
+				timeout = atoi(v);
+		} else if (strcmp(p, "mlock") == 0) {
+			if (strcmp(v, "yes") == 0)
+				no_mlock = 0;
+			else if (strcmp(v, "no") == 0)
+				no_mlock = 1;
+			else
+				warnx("no_mlock must be 'yes' or 'no'");
+		} else if (strcmp(p, "max_value_length") == 0) {
+			if (atoi(v) < 0)
+				warnx("invalid max_value_length specified; "
+				    "minimum is 64");
+			else
+				max_value_length = atoi(v);
+		} else {
+			warnx("unknown parameter: %s", p);
+			continue;
+		}
+
+		if (debug_level)
+			warnx("read_cfg: %s => %s", p, v);
+	}
+
+	if (*encrypt_cmd == '\0')
+		warnx("no encryption command defined; you will not be able to save");
+
+	if (*decrypt_cmd == '\0')
+		errx(1, "no decrypt command defined; exiting");
+
+	if (!str_replace(decrypt_cmd, sizeof(decrypt_cmd), "%db", db_path))
+		errx(1, "decryption command was truncated; exiting");
+
+	if (*paste_cmd == '\0')
+		warnx("no paste command defined");
+
+	fclose(cfg);
 }
 
 void
 load_db()
 {
-	FILE                   *cmd_fd;
-	char                    cmd[PATH_MAX + 1];
-	size_t                  r;
-	size_t                  pos = 0;
-        char                   *buf;
-	enum json_tokener_error error;
-	int                     st;
+	FILE         *cmd_fd;
+	char          cmd[PATH_MAX + 1];
+	int           status;
+	struct stat   st;
+	json_error_t  error;
 
 	if (access(db_path, F_OK) == -1) {
 		warnx("database %s does not exist; will create", db_path);
@@ -123,58 +289,46 @@ load_db()
 	if (snprintf(cmd, sizeof(cmd), decrypt_cmd, db_path) >= sizeof(cmd))
 		errx(1, "cannot decrypt; command too long");
 
+	if (stat(db_path, &st) == -1)
+		err(1, "stat");
+
+	if (st.st_uid != getuid())
+		errx(1, "database file ownership is incorrect; "
+		    "you should own it");
+
+	if (st.st_mode & (S_IRWXO|S_IRWXG))
+		errx(1, "database file permissions are incorrect; "
+		    "only the owner should have access");
+
 	cmd_fd = popen(cmd, "r");
 	if (cmd_fd == NULL)
 		err(1, "cannot decrypt; popen");
 
-	buf = malloc(buf_size);
-	if (buf == NULL)
-		mem_err(buf_size);
-
-	for (;;) {
-		r = fread(buf + pos, 1, buf_size - pos, cmd_fd);
-		if (r == 0)
-			break;
-
-		pos += r;
-		if (pos >= buf_size) {
-			buf_size *= 2;
-			buf = realloc(buf, buf_size);
-			if (buf == NULL)
-				mem_err(buf_size);
-		}
-	}
-
-	if (ferror(cmd_fd))
-		err(1, "fread");
-
-	db = json_tokener_parse_verbose(buf, &error);
+	db = json_loadf(cmd_fd, JSON_REJECT_DUPLICATES, &error);
 	if (db == NULL)
-		errx(1, "error: %s\n", json_tokener_error_desc(error));
-	wipe_mem(buf, buf_size);
+		errx(1, "JSON parse error (line %d): %s\n",
+		    error.line, error.text);
 
-	st = pclose(cmd_fd);
-	switch (st) {
+	status = pclose(cmd_fd);
+	switch (status) {
 	case -1:
 		err(1, "popen");
 	case 0:
 		break;
 	default:
 		errx(1, "decrypt command failed with code %d: %s",
-		    st, cmd);
+		    status, cmd);
 	}
 }
 
 void
 save_db()
 {
-	FILE       *cmd_fd;
-	char        cmd[PATH_MAX + 1];
-	char        tmp_db_path[PATH_MAX + 1];
-	int         tmp_fd;
-	size_t      w;
-	const char *buf;
-	int         st;
+	FILE *cmd_fd;
+	char  cmd[PATH_MAX * 2];
+	char  tmp_db_path[PATH_MAX + 1];
+	int   tmp_fd;
+	int   status;
 
 	umask(0077);
 
@@ -195,12 +349,22 @@ save_db()
 		return;
 	}
 
-	if (snprintf(cmd, sizeof(cmd), encrypt_cmd, key_id, tmp_db_path)
-	    >= sizeof(cmd)) {
+	warnx("created tmp save file: %s", tmp_db_path);
+
+	if (snprintf(cmd, sizeof(cmd), "%s", encrypt_cmd) >= sizeof(cmd)) {
+		warnx("encryption command was truncated; exiting");
+		unlink(tmp_db_path);
+		return;
+	}
+
+	if (!str_replace(cmd, sizeof(cmd), "%db", tmp_db_path)) {
 		warnx("cannot encrypt; command too long");
 		unlink(tmp_db_path);
 		return;
 	}
+
+	if (debug_level)
+		warnx("saving: %s", cmd);
 
 	cmd_fd = popen(cmd, "w");
 	if (cmd_fd == NULL) {
@@ -209,44 +373,43 @@ save_db()
 		return;
 	}
 
-	buf = json_object_to_json_string_ext(db,
-	    JSON_C_TO_STRING_SPACED | JSON_C_TO_STRING_PRETTY);
-	if (buf == NULL || *buf == '\0') {
+	if (json_dumpf(db, cmd_fd, JSON_INDENT(2) | JSON_SORT_KEYS) == -1) {
 		warn("could not prepare JSON output");
 		unlink(tmp_db_path);
 		pclose(cmd_fd);
 		return;
 	}
 
-	w = fwrite(buf, 1, strlen(buf), cmd_fd);
-	if (w < strlen(buf)) {
-		warn("failed to write DB; write count: %lu", w);
-		unlink(tmp_db_path);
-		pclose(cmd_fd);
-		return;
-	}
-
-	st = pclose(cmd_fd);
-	switch (st) {
+	status = pclose(cmd_fd);
+	switch (status) {
 	case -1:
 		warn("could not properly close file: %s", db_path);
 		return;
 	case 0:
 		break;
 	default:
-		warnx("encrypt command failed with code %d: '%s'", st, cmd);
+		warnx("encrypt command failed with code %d: '%s'",
+		    status, cmd);
 		return;
 	}
 
 	if (rename(tmp_db_path, db_path) == -1)
 		warn("count not rename %s to %s", tmp_db_path, db_path);
+
+	if (debug_level)
+		warnx("successfully saved; renaming %s to %s",
+		    tmp_db_path, db_path);
+
+	db_modified = 0;
 }
 
-struct json_object *
+json_t *
 get_secrets()
 {
-	struct json_object *secrets;
-	if (!json_object_object_get_ex(db, "secrets", &secrets))
+	json_t *secrets;
+
+	secrets = json_object_get(db, "secrets");
+	if (secrets == NULL)
 		errx(1, "could not find \"secrets\" object; "
 		    "invalid file format");
 	return secrets;
@@ -261,32 +424,31 @@ cmp_key(const void *p1, const void *p2)
 void
 list_secrets(const char *pattern)
 {
-	struct json_object_iterator   i;
-	struct json_object_iterator   il;
-	size_t                        key;
-	size_t                        n_keys;
-	size_t                        n_keys_max = buf_size / 128;
-	const char                  **keys;
-	const char                   *name;
+	void        *iter;
+	size_t       key;
+	size_t       n_keys;
+	size_t       n_keys_max;
+	const char **keys, **new_keys;
+	const char  *name;
 
-	keys = malloc(n_keys_max * sizeof(char *));
-	if (keys == NULL) {
-		mem_warn(n_keys_max * sizeof(char *));
+	n_keys_max = json_object_size(get_secrets()) * 2;
+
+	keys = locked_mem(n_keys_max * sizeof(char *));
+	if (keys == NULL)
 		return;
-	}
 
-	for (n_keys = 0, i = json_object_iter_begin(get_secrets()),
-	    il = json_object_iter_end(get_secrets());
-	    !json_object_iter_equal(&i, &il); json_object_iter_next(&i)) {
+	for (iter = json_object_iter(get_secrets()); iter != NULL;
+	    iter = json_object_iter_next(get_secrets(), iter)) {
 		if (n_keys > n_keys_max) {
-			keys = realloc(keys, n_keys_max * 2 * sizeof(char *));
-			if (keys == NULL) {
-				mem_warn(n_keys_max * 2 * sizeof(char *));
+			new_keys = locked_mem(n_keys_max * 2 * sizeof(char *));
+			if (new_keys == NULL)
 				goto end;
-			}
+			memcpy(new_keys, keys, n_keys * sizeof(char *));
+			wipe_mem(keys);
+			keys = new_keys;
 			n_keys_max *= 2;
 		}
-		name = json_object_iter_peek_name(&i);
+		name = json_object_iter_key(iter);
 		if (pattern) {
 			if (strstr(name, pattern)) {
 				keys[n_keys] = name;
@@ -305,25 +467,20 @@ list_secrets(const char *pattern)
 	}
 
 end:
-	wipe_mem(keys, n_keys_max * sizeof(char *));
+	wipe_mem(keys);
 }
 
-struct json_object *
+json_t *
 find_secret(const char *key)
 {
-	struct json_object  *s;
-
-	if (!json_object_object_get_ex(get_secrets(), key, &s))
-		return NULL;
-
-	return s;
+	return json_object_get(get_secrets(), key);
 }
 
 void
-show_secret(struct json_object *obj, int hide_secret)
+show_secret(json_t *obj, int hide_secret)
 {
-	struct json_object  *v;
-	const char         **f;
+	json_t      *v;
+	const char **f;
 
 	if (obj == NULL) {
 		printf("secret not found\n");
@@ -333,18 +490,18 @@ show_secret(struct json_object *obj, int hide_secret)
 	for (f = fields; *f; f++) {
 		if (hide_secret && strcmp(*f, "secret") == 0)
 			printf("%s: ******\n", *f);
-		else if (json_object_object_get_ex(obj, *f, &v))
-			printf("%s: %s\n", *f, json_object_get_string(v));
+		else if ((v = json_object_get(obj, *f)))
+			printf("%s: %s\n", *f, json_string_value(v));
 	}
 }
 
 void
-paste(struct json_object *obj)
+paste(json_t *obj)
 {
-	struct json_object  *v;
-	FILE                *cmd_fd;
-	const char          *secret;
-	size_t               w;
+	json_t     *v;
+	FILE       *cmd_fd;
+	const char *secret;
+	size_t      w;
 
 	if (obj == NULL) {
 		printf("secret not found\n");
@@ -357,12 +514,13 @@ paste(struct json_object *obj)
 		return;
 	}
 
-	if (!json_object_object_get_ex(obj, "secret", &v)) {
+	v = json_object_get(obj, "secret");
+	if (v == NULL) {
 		warnx("could not get secret");
 		pclose(cmd_fd);
 		return;
 	}
-	secret = json_object_get_string(v);
+	secret = json_string_value(v);
 
 	w = fwrite(secret, 1, strlen(secret), cmd_fd);
 	if (w < strlen(secret))
@@ -378,12 +536,41 @@ paste(struct json_object *obj)
 	}
 }
 
+int
+confirm(const char *prompt, int dflt)
+{
+	char c;
+
+	printf("%s ", prompt);
+	fflush(stdout);
+
+	for (;;) {
+		c = getchar();
+
+		if (c == '\n')
+			return dflt;
+
+		while (getchar() != '\n');
+
+		switch (c) {
+		case 'y':
+		case 'Y':
+			return 1;
+		case 'n':
+		case 'N':
+			return 0;
+		default:
+			printf("Please answer with 'y' or 'n': ");
+			fflush(stdout);
+		}
+	}
+}
+
 char *
 read_field(const char *name, int echo)
 {
-	char                *input;
-	struct termios       saved_ts, new_ts;
-	size_t               line_size = 0;
+	char           *input;
+	struct termios  saved_ts, new_ts;
 
 	printf("%s: ", name);
 	fflush(stdout);
@@ -399,8 +586,12 @@ read_field(const char *name, int echo)
 			err(1, "cannot set terminal settings");
 	}
 
-	if (getline(&input, &line_size, stdin) == -1)
-		err(1, "getline");
+	input = locked_mem(max_value_length);
+	if (input == NULL)
+		err(1, "could not read field");
+
+	if (fgets(input, max_value_length + 1, stdin) == NULL)
+		err(1, "fgets");
 
 	if (!echo) {
 		if (tcsetattr(0, TCSANOW, &saved_ts) == -1)
@@ -415,9 +606,9 @@ read_field(const char *name, int echo)
 void
 add_secret(const char *key, int overwrite)
 {
-	struct json_object  *s;
-	char                *input, *input2;
-	const char         **f;
+	json_t      *s;
+	char        *input, *input2;
+	const char **f;
 
 	if (find_secret(key) && !overwrite) {
 		printf("secret already exists\n");
@@ -425,9 +616,10 @@ add_secret(const char *key, int overwrite)
 	}
 
 	if (!overwrite) {
-		s = json_object_new_object();
+		s = json_object();
 	} else {
-		if (!json_object_object_get_ex(get_secrets(), key, &s)) {
+		s = json_object_get(get_secrets(), key);
+		if (s == NULL) {
 			printf("couldn't get secret %s\n", key);
 			return;
 		}
@@ -435,19 +627,19 @@ add_secret(const char *key, int overwrite)
 
 	for (f = fields; *f; f++) {
 		if (overwrite) {
-			printf("Change %s ? [n]", *f);
-			input = read_field("", 1);
-			if (toupper(*input) != 'Y') {
-				free(input);
+			printf("Change %s ? [y/N]", *f);
+			if (!confirm("", 0))
 				continue;
-			}
 		}
 		if (strcmp(*f, "secret") == 0) {
 			for (;;) {
 				input = read_field("secret", 0);
 				input2 = read_field("confirm secret", 0);
-				if (strcmp(input, input2) == 0)
+				if (strcmp(input, input2) == 0) {
+					wipe_mem(input2);
 					break;
+				}
+				wipe_mem(input2);
 				printf("secrets don't match; try again\n");
 			}
 		} else {
@@ -455,10 +647,10 @@ add_secret(const char *key, int overwrite)
 		}
 
 		if (overwrite)
-			json_object_object_del(s, *f);
+			json_object_del(s, *f);
 
-		json_object_object_add(s, *f, json_object_new_string(input));
-		wipe_mem(input, strlen(input) + 1);
+		json_object_set_new(s, *f, json_string(input));
+		wipe_mem(input);
 	}
 
 	if (overwrite) {
@@ -470,23 +662,11 @@ add_secret(const char *key, int overwrite)
 
 	show_secret(s, 1);
 
-	input = readline("[Y/n]: ");
-	if (input == NULL)
+	if (!confirm("[Y/n]:", 1))
 		return;
-
-	switch (*input) {
-	case 'n':
-	case 'N':
-		return;
-	case 'y':
-	case 'Y':
-	default:
-		break;
-	}
 
 	if (!overwrite)
-		json_object_object_add(get_secrets(), key, s);
-
+		json_object_set_new(get_secrets(), key, s);
 
 	if (overwrite)
 		printf("Changed %s\n", key);
@@ -497,24 +677,13 @@ add_secret(const char *key, int overwrite)
 void
 delete_secret(const char *key)
 {
-	char *input;
-
 	if (key == NULL)
 		return;
 
-	input = readline("Are you sure [y/N]: ");
-	if (input == NULL)
+	if (!confirm("Are you sure [y/N]:", 0))
 		return;
 
-	switch (*input) {
-	case 'y':
-	case 'Y':
-		break;
-	default:
-		return;
-	}
-
-	json_object_object_del(get_secrets(), key);
+	json_object_del(get_secrets(), key);
 	printf("Deleted %s\n", key);
 }
 
@@ -524,28 +693,25 @@ reset_timer()
 	struct itimerval exit_timer;
 
 	memset(&exit_timer, 0, sizeof(exit_timer));
+	exit_timer.it_value.tv_sec = timeout;
 
-	if (gettimeofday(&exit_timer.it_value, NULL) == -1)
-		err(1, "gettimeofday");
-
-	exit_timer.it_value.tv_sec += timeout;
-
-	// Uh??
 	if (setitimer(ITIMER_REAL, &exit_timer, NULL) == -1)
 		err(1, "setitimer");
+
+	if (debug_level)
+		warnx("timer set to exit in %lu seconds",
+			exit_timer.it_value.tv_sec);
 }
 
 void
-handle_segv(int unused)
+timeout_exit()
 {
-	struct rusage ru;
-
-	// TODO: once we change to a better json lib, we might not need
-	// this probably explanation text.
-	warnx("caught SIGSEGV; "
-	    "probably ran out of memory during JSON parsing");
-	getrusage(RUSAGE_SELF, &ru);
-	errx(1, "current memory usage: %ld kb", ru.ru_maxrss);
+	warnx("timeout reached");
+	if (db_modified) {
+		warnx("saving database");
+		save_db();
+	}
+	exit(0);
 }
 
 int
@@ -555,55 +721,47 @@ main(int argc, char **argv)
 	char *line = NULL;
 	char *token;
 	int   quit = 0;
-	int   modified = 0;
-	int   no_mlock = 0;
 	char  prompt[sizeof(program_name) + 2];
 
 	struct sigaction act, oact;
+	struct rlimit no_core = {0, 0};
 
-	// TODO: check the returned length
 	snprintf(prompt, sizeof(prompt), "%s> ", program_name);
-	snprintf(db_path, sizeof(db_path), "%s/.%s.json.gpg",
-	    getenv("HOME"), program_name);
 
-	// TODO: implement timer (SIGALRM?)
+	if (snprintf(db_path, sizeof(db_path), "%s/.%s.json.gpg",
+	    getenv("HOME"), program_name) >= sizeof(db_path))
+		errx(1, "db path is too long");
+
+	if (snprintf(cfg_path, sizeof(cfg_path), "%s/.%s.conf",
+	    getenv("HOME"), program_name) >= sizeof(cfg_path))
+		errx(1, "cfg path is too long");
+
 	// TODO: better signal handling, show message. Block signals instead
-	// of ignore? Ignore sigchild?
+	// of ignore?
 
-
+	memset(&act, 0, sizeof(act));
 	act.sa_handler = SIG_IGN;
-	sigemptyset(&act.sa_mask);
-	act.sa_flags = 0;
 	if (sigaction(SIGINT, &act, &oact) == -1
-	    || sigaction(SIGQUIT, &act, &oact) == -1) {
+	    || sigaction(SIGQUIT, &act, &oact) == -1)
 		err(1, "sigaction");
-	}
 
-	// Catch SIGSEGV as well until we find a better json lib that let's
-	// us manage memory ourselves.
-	act.sa_handler = &handle_segv;
-	sigemptyset(&act.sa_mask);
-	act.sa_flags = 0;
-	if (sigaction(SIGSEGV, &act, &oact) == -1) {
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = timeout_exit;
+	if (sigaction(SIGALRM, &act, &oact) == -1)
 		err(1, "sigaction");
-	}
 
-	while ((opt = getopt(argc, argv, "hf:t:k:nv")) != -1) {
+	while ((opt = getopt(argc, argv, "dvhc:")) != -1) {
 		switch (opt) {
-		case 'n':
-			no_mlock = 1;
-			break;
-		case 'k':
-			strncpy(key_id, optarg, sizeof(key_id) - 1);
-			break;
-		case 't':
-			timeout = atoi(optarg);
-			break;
 		case 'h':
 			print_help();
 			exit(0);
-		case 'f':
-			strncpy(db_path, optarg, sizeof(db_path) - 1);
+		case 'd':
+			debug_level++;
+			break;
+		case 'c':
+			if (snprintf(cfg_path, sizeof(cfg_path), "%s", optarg)
+			    >= sizeof(cfg_path))
+				errx(1, "specified path is too long");
 			break;
 		case 'v':
 			printf("%s version %s\n", PROGNAME, VERSION);
@@ -611,20 +769,16 @@ main(int argc, char **argv)
 		}
 	}
 
-	if (*key_id == '\0')
-		errx(1, "key_id cannot be empty; use -k");
+	warnx("debug level set to %d", debug_level);
+
+	read_cfg();
 
 	reset_timer();
 
-	if (!no_mlock && mlockall(MCL_FUTURE) == -1) {
-		if (errno == ENOMEM) {
-			warnx("Could not lock database in RAM; "
-			    "contents might be swapped to disk");
-			warnx("Check your ulimit for max locked memory");
-		} else {
-			err(1, "mlockall");
-		}
-	}
+	if (setrlimit(RLIMIT_CORE, &no_core) == -1)
+		warn("could not disable core dumps; setrlimit");
+
+	json_set_alloc_funcs(locked_mem, wipe_mem);
 
 	load_db();
 
@@ -632,7 +786,7 @@ main(int argc, char **argv)
 		line = readline(prompt);
 		reset_timer();
 		if (line == NULL) {
-			if (modified) {
+			if (db_modified) {
 				printf("Changes were made; either save or "
 				    "use quit\n");
 				continue;
@@ -654,7 +808,7 @@ main(int argc, char **argv)
 				goto again;
 			}
 			add_secret(token, 0);
-			modified = 1;
+			db_modified = 1;
 		} else if (strcmp(token, "change") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
@@ -662,7 +816,7 @@ main(int argc, char **argv)
 				goto again;
 			}
 			add_secret(token, 1);
-			modified = 1;
+			db_modified = 1;
 		} else if (strcmp(token, "delete") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
@@ -670,7 +824,7 @@ main(int argc, char **argv)
 				goto again;
 			}
 			delete_secret(token);
-			modified = 1;
+			db_modified = 1;
 		} else if (strcmp(token, "help") == 0) {
 			printf("Help: add, change, delete, help, list, paste, quit, save, show, showall\n");
 		} else if (strcmp(token, "list") == 0) {
@@ -682,18 +836,15 @@ main(int argc, char **argv)
 				goto again;
 			paste(find_secret(token));
 		} else if (strcmp(token, "quit") == 0) {
-			if (modified) {
-				token = read_field("Changes were made; "
-				    "exit without saving? [y/N]", 1);
-				if (toupper(*token) == 'Y')
+			if (db_modified) {
+				if (confirm("Changes were made; "
+				    "exit without saving? [y/N]", 0))
 					quit = 1;
-				free(token);
 			} else {
 				quit = 1;
 			}
 		} else if (strcmp(token, "save") == 0) {
 			save_db();
-			modified = 0;
 		} else if (strcmp(token, "showall") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL)
@@ -708,11 +859,10 @@ main(int argc, char **argv)
 			printf("unknown command\n");
 		}
 again:
-		wipe_mem(line, strlen(line) + 1);
+		free(line);
 	}
 
-	// TODO: need to find a way to wipe_mem() here too
-	json_object_put(db);
+	json_object_clear(db);
 
 	printf("Bye.\n");
 	return 0;
