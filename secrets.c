@@ -769,11 +769,14 @@ main(int argc, char **argv)
 		}
 	}
 
-	warnx("debug level set to %d", debug_level);
+	if (debug_level)
+		warnx("debug level set to %d", debug_level);
 
 	read_cfg();
 
 	reset_timer();
+
+	warnx("timeout set to %d seconds", timeout);
 
 	if (setrlimit(RLIMIT_CORE, &no_core) == -1)
 		warn("could not disable core dumps; setrlimit");
