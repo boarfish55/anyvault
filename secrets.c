@@ -715,6 +715,13 @@ reset_timer()
 }
 
 void
+sigterm()
+{
+	json_object_clear(db);
+	exit(0);
+}
+
+void
 timeout_exit()
 {
 	warnx("timeout reached");
@@ -764,6 +771,11 @@ main(int argc, char **argv)
 	memset(&act, 0, sizeof(act));
 	act.sa_handler = timeout_exit;
 	if (sigaction(SIGALRM, &act, &oact) == -1)
+		err(1, "sigaction");
+
+	memset(&act, 0, sizeof(act));
+	act.sa_handler = sigterm;
+	if (sigaction(SIGTERM, &act, &oact) == -1)
 		err(1, "sigaction");
 
 	while ((opt = getopt(argc, argv, "dvhc:")) != -1) {
