@@ -736,28 +736,22 @@ reset_timer()
 }
 
 void
-sigterm()
+sig_handler(int sig)
 {
+	if (sig == SIGALRM)
+		warnx("timeout reached");
 	json_object_clear(db);
 	exit(0);
 }
 
 void
-sigint()
+sig_int()
 {
 	/*
 	 * Child processes will reset the handler on execve(),
 	 * so we have nothing more to do here.
 	 */
 	warnx("Interrupt sent to child processes");
-}
-
-void
-timeout_exit()
-{
-	warnx("timeout reached");
-	json_object_clear(db);
-	exit(0);
 }
 
 int
@@ -770,7 +764,6 @@ main(int argc, char **argv)
 	char  prompt[sizeof(program_name) + 2];
 
 	struct sigaction act;
-	sigset_t block_mask;
 
 	struct rlimit no_core = {0, 0};
 
@@ -788,23 +781,18 @@ main(int argc, char **argv)
 	    getenv("HOME"), program_name) >= sizeof(cfg_path))
 		errx(1, "cfg path is too long");
 
-	sigemptyset(&block_mask);
-	sigaddset(&block_mask, SIGINT);
-	sigaddset(&block_mask, SIGTERM);
-	sigaddset(&block_mask, SIGALRM);
-	act.sa_mask = block_mask;
+	sigemptyset(&act.sa_mask);
+	sigaddset(&act.sa_mask, SIGINT);
+	sigaddset(&act.sa_mask, SIGTERM);
+	sigaddset(&act.sa_mask, SIGALRM);
 	act.sa_flags = 0;
+	act.sa_handler = sig_handler;
+	if (sigaction(SIGALRM, &act, NULL) == -1
+	    || sigaction(SIGTERM, &act, NULL) == -1)
+		err(1, "sigaction");
 
-	act.sa_handler = sigint;
+	act.sa_handler = sig_int;
 	if (sigaction(SIGINT, &act, NULL) == -1)
-		err(1, "sigaction");
-
-	act.sa_handler = timeout_exit;
-	if (sigaction(SIGALRM, &act, NULL) == -1)
-		err(1, "sigaction");
-
-	act.sa_handler = sigterm;
-	if (sigaction(SIGTERM, &act, NULL) == -1)
 		err(1, "sigaction");
 
 	while ((opt = getopt(argc, argv, "dvhc:")) != -1) {
