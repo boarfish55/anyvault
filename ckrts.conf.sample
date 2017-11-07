@@ -1,8 +1,8 @@
 # The encrypted password database. Must be owned by the user, and mode 0600.
-db_path: /home/plalonde/prog/secrets/secrets.json.gpg
+db_path: /home/plalonde/prog/ckrts/ckrts.json.gpg
 
 # Before saving, move the previous database to this location.
-backup_db_path: /home/plalonde/prog/secrets/secrets.json.gpg~
+backup_db_path: /home/plalonde/prog/ckrts/ckrts.json.gpg~
 
 # Save the database each time a change (add, change, delete) is made.
 autosave: yes
