@@ -17,24 +17,25 @@
 #include <readline/history.h>
 #include <jansson.h>
 
-const char          program_name[] = PROGNAME;
-const char         *version = VERSION;
+const char  program_name[] = PROGNAME;
+const char *version = VERSION;
 
-char                cfg_path[PATH_MAX + 1];
-char                db_path[PATH_MAX + 1];
-char                bk_db_path[PATH_MAX + 1];
-int                 timeout = 300;
-size_t              max_value_length = 2048;
-int                 no_mlock = 0;
-int                 debug_level = 0;
+char   cfg_path[PATH_MAX + 1];
+char   db_path[PATH_MAX + 1];
+char   bk_db_path[PATH_MAX + 1];
+int    timeout = 300;
+size_t max_value_length = 2048;
+int    no_mlock = 0;
+int    autosave = 1;
+int    debug_level = 0;
+char   encrypt_cmd[PATH_MAX * 2] = "";
+char   decrypt_cmd[PATH_MAX * 2] = "";
+char   paste_cmd[PATH_MAX * 2] = "/usr/bin/xclip -l 1";
 
+int                 db_backup_done = 0;
 int                 db_modified = 0;
 json_t             *db;
 const char         *fields[] = { "notes", "url", "login", "secret", NULL };
-
-char encrypt_cmd[PATH_MAX * 2] = "";
-char decrypt_cmd[PATH_MAX * 2] = "";
-char paste_cmd[PATH_MAX * 2] = "/usr/bin/xclip -l 1";
 
 void
 print_help()
@@ -123,6 +124,13 @@ end:
 			    locked_allocated);
 	}
 	free(p);
+}
+
+FILE *
+safe_popen(const char *program[], const char *type)
+{
+	// TODO: make things safer than popen()
+	return NULL;
 }
 
 int
@@ -243,6 +251,13 @@ read_cfg()
 				no_mlock = 1;
 			else
 				warnx("no_mlock must be 'yes' or 'no'");
+		} else if (strcmp(p, "autosave") == 0) {
+			if (strcmp(v, "yes") == 0)
+				autosave = 1;
+			else if (strcmp(v, "no") == 0)
+				autosave = 0;
+			else
+				warnx("autosave must be 'yes' or 'no'");
 		} else if (strcmp(p, "max_value_length") == 0) {
 			if (atoi(v) < 0)
 				warnx("invalid max_value_length specified; "
@@ -399,10 +414,15 @@ save_db()
 		return;
 	}
 
-	if (debug_level)
-		warnx("backuping up before saving: %s", bk_db_path);
-	if (rename(db_path, bk_db_path) == -1)
-		warn("could not rename %s to %s", db_path, bk_db_path);
+
+	/* We only do this once per run, even if we save multiple times */
+	if (!db_backup_done) {
+		if (debug_level)
+			warnx("backuping up before saving: %s", bk_db_path);
+		if (rename(db_path, bk_db_path) == -1)
+			warn("could not rename %s to %s", db_path, bk_db_path);
+		db_backup_done = 1;
+	}
 
 	if (rename(tmp_db_path, db_path) == -1)
 		warn("could not rename %s to %s", tmp_db_path, db_path);
@@ -412,6 +432,7 @@ save_db()
 		    tmp_db_path, db_path);
 
 	db_modified = 0;
+	warnx("changes were saved to %s", db_path);
 }
 
 json_t *
@@ -722,13 +743,19 @@ sigterm()
 }
 
 void
+sigint()
+{
+	/*
+	 * Child processes will reset the handler on execve(),
+	 * so we have nothing more to do here.
+	 */
+	warnx("Interrupt sent to child processes");
+}
+
+void
 timeout_exit()
 {
 	warnx("timeout reached");
-	if (db_modified) {
-		warnx("saving database");
-		save_db();
-	}
 	json_object_clear(db);
 	exit(0);
 }
@@ -742,7 +769,9 @@ main(int argc, char **argv)
 	int   quit = 0;
 	char  prompt[sizeof(program_name) + 2];
 
-	struct sigaction act, oact;
+	struct sigaction act;
+	sigset_t block_mask;
+
 	struct rlimit no_core = {0, 0};
 
 	snprintf(prompt, sizeof(prompt), "%s> ", program_name);
@@ -759,23 +788,23 @@ main(int argc, char **argv)
 	    getenv("HOME"), program_name) >= sizeof(cfg_path))
 		errx(1, "cfg path is too long");
 
-	// TODO: better signal handling, show message. Block signals instead
-	// of ignore?
+	sigemptyset(&block_mask);
+	sigaddset(&block_mask, SIGINT);
+	sigaddset(&block_mask, SIGTERM);
+	sigaddset(&block_mask, SIGALRM);
+	act.sa_mask = block_mask;
+	act.sa_flags = 0;
 
-	memset(&act, 0, sizeof(act));
-	act.sa_handler = SIG_IGN;
-	if (sigaction(SIGINT, &act, &oact) == -1
-	    || sigaction(SIGQUIT, &act, &oact) == -1)
+	act.sa_handler = sigint;
+	if (sigaction(SIGINT, &act, NULL) == -1)
 		err(1, "sigaction");
 
-	memset(&act, 0, sizeof(act));
 	act.sa_handler = timeout_exit;
-	if (sigaction(SIGALRM, &act, &oact) == -1)
+	if (sigaction(SIGALRM, &act, NULL) == -1)
 		err(1, "sigaction");
 
-	memset(&act, 0, sizeof(act));
 	act.sa_handler = sigterm;
-	if (sigaction(SIGTERM, &act, &oact) == -1)
+	if (sigaction(SIGTERM, &act, NULL) == -1)
 		err(1, "sigaction");
 
 	while ((opt = getopt(argc, argv, "dvhc:")) != -1) {
@@ -794,6 +823,9 @@ main(int argc, char **argv)
 		case 'v':
 			printf("%s version %s\n", PROGNAME, VERSION);
 			exit(0);
+		default:
+			print_help();
+			exit(1);
 		}
 	}
 
@@ -840,6 +872,8 @@ main(int argc, char **argv)
 			}
 			add_secret(token, 0);
 			db_modified = 1;
+			if (autosave)
+				save_db();
 		} else if (strcmp(token, "change") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
@@ -848,6 +882,8 @@ main(int argc, char **argv)
 			}
 			add_secret(token, 1);
 			db_modified = 1;
+			if (autosave)
+				save_db();
 		} else if (strcmp(token, "delete") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
@@ -856,6 +892,8 @@ main(int argc, char **argv)
 			}
 			delete_secret(token);
 			db_modified = 1;
+			if (autosave)
+				save_db();
 		} else if (strcmp(token, "help") == 0) {
 			printf("Help: add, change, delete, help, list, paste, quit, save, show, showall\n");
 		} else if (strcmp(token, "list") == 0) {
