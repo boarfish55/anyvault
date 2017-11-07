@@ -1,4 +1,4 @@
-PROGNAME=secrets
+PROGNAME=ckrts
 VERSION=1.0
 
 all: $(PROGNAME)
