@@ -1,4 +1,4 @@
-secrets lets you manage a JSON database of passwords using an external
+ckrts lets you manage a JSON database of secrets using an external
 encryption/decryption command (such as GnuPG).
 
 Dependencies:
