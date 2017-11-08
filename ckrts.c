@@ -20,17 +20,17 @@
 const char  program_name[] = PROGNAME;
 const char *version = VERSION;
 
-char   cfg_path[PATH_MAX + 1];
-char   db_path[PATH_MAX + 1];
-char   bk_db_path[PATH_MAX + 1];
-int    timeout = 300;
-size_t max_value_length = 2048;
-int    no_mlock = 0;
-int    autosave = 1;
-int    debug_level = 0;
-char   encrypt_cmd[PATH_MAX * 2] = "";
-char   decrypt_cmd[PATH_MAX * 2] = "";
-char   paste_cmd[PATH_MAX * 2] = "/usr/bin/xclip -l 1";
+char    cfg_path[PATH_MAX + 1];
+char    db_path[PATH_MAX + 1];
+char    bk_db_path[PATH_MAX + 1];
+int     timeout = 300;
+size_t  max_value_length = 2048;
+int     no_mlock = 0;
+int     autosave = 1;
+int     debug_level = 0;
+char   *encrypt_cmd = NULL;
+char   *decrypt_cmd = NULL;
+char   *paste_cmd = NULL;
 
 int                 db_backup_done = 0;
 int                 db_modified = 0;
@@ -133,33 +133,44 @@ safe_popen(const char *program[], const char *type)
 	return NULL;
 }
 
-int
-str_replace(char *str, size_t max, const char *token, const char *value)
+char *
+str_replace(const char *str, const char *search, const char *replace)
 {
-	char *pos, *end;
+	const char *pos, *prev;
+	char       *result, *saved;
+	size_t      search_len;
 
-	// TODO: this is pretty ugly. Maybe something better with
-	// allocated memory? We should dynamically allocate, and replace
-	// every occurence of the word.
+	pos = strstr(str, search);
+	if (pos == NULL || search == NULL)
+		return strdup(str);
 
-	if (str == NULL || value == NULL)
-		return 1;
+	search_len = strlen(search);
+	result = NULL;
+	prev = NULL;
 
-	if (token == NULL || (pos = strstr(str, token)) == NULL)
-		return strlen(str);
+	if (asprintf(&result, "%.*s%s", (int)(pos - str), str, replace) == -1)
+		return NULL;
+	prev = pos + search_len;
+	saved = result;
 
-	if (strlen(str) + strlen(value) - strlen(token) >= max)
-		return 0;
+	while ((pos = strstr(prev, search))) {
+		if (asprintf(&result, "%s%.*s%s", saved,
+		    (int)(pos - prev), prev, replace) == -1)
+			goto err;
 
-	end = str + strlen(str);
+		free(saved);
+		prev = pos + search_len;
+		saved = result;
+	}
 
-	memmove(pos + strlen(value), pos + strlen(token),
-	    end - (pos + strlen(token)));
+	if (asprintf(&result, "%s%s", saved, prev) == -1)
+		goto err;
+	free(saved);
 
-	strncpy(pos, value, strlen(value));
-	str[(end - str) + strlen(value) - strlen(token)] = '\0';
-
-	return 1;
+	return result;
+err:
+	free(saved);
+	return NULL;
 }
 
 void
@@ -220,17 +231,17 @@ read_cfg()
 			v++;
 
 		if (strcmp(p, "encrypt_cmd") == 0) {
-			if (snprintf(encrypt_cmd, sizeof(encrypt_cmd), "%s", v)
-			    >= sizeof(encrypt_cmd))
-				warnx("value of %s was truncated", p);
+			encrypt_cmd = strdup(v);
+			if (encrypt_cmd == NULL)
+				err(1, "could not load encrypt command");
 		} else if (strcmp(p, "decrypt_cmd") == 0) {
-			if (snprintf(decrypt_cmd, sizeof(decrypt_cmd), "%s", v)
-			    >= sizeof(decrypt_cmd))
-				warnx("value of %s was truncated", p);
+			decrypt_cmd = str_replace(v, "%db", db_path);
+			if (decrypt_cmd == NULL)
+				err(1, "could not load decrypt command");
 		} else if (strcmp(p, "paste_cmd") == 0) {
-			if (snprintf(paste_cmd, sizeof(paste_cmd), "%s", v)
-			    >= sizeof(paste_cmd))
-				warnx("value of %s was truncated", p);
+			paste_cmd = strdup(v);
+			if (paste_cmd == NULL)
+				err(1, "could not load paste command");
 		} else if (strcmp(p, "db_path") == 0) {
 			if (snprintf(db_path, sizeof(db_path), "%s", v)
 			    >= sizeof(db_path))
@@ -273,16 +284,13 @@ read_cfg()
 			warnx("read_cfg: %s => %s", p, v);
 	}
 
-	if (*encrypt_cmd == '\0')
+	if (encrypt_cmd == NULL)
 		warnx("no encryption command defined; you will not be able to save");
 
-	if (*decrypt_cmd == '\0')
-		errx(1, "no decrypt command defined; exiting");
+	if (decrypt_cmd == NULL)
+		errx(1, "no decryption command defined");
 
-	if (!str_replace(decrypt_cmd, sizeof(decrypt_cmd), "%db", db_path))
-		errx(1, "decryption command was truncated; exiting");
-
-	if (*paste_cmd == '\0')
+	if (paste_cmd == NULL)
 		warnx("no paste command defined");
 
 	fclose(cfg);
@@ -292,7 +300,6 @@ void
 load_db()
 {
 	FILE         *cmd_fd;
-	char          cmd[PATH_MAX + 1];
 	int           status;
 	struct stat   st;
 	json_error_t  error;
@@ -306,9 +313,6 @@ load_db()
 		err(1, "cannot access database %s; "
 		    "make sure it is readable", db_path);
 
-	if (snprintf(cmd, sizeof(cmd), decrypt_cmd, db_path) >= sizeof(cmd))
-		errx(1, "cannot decrypt; command too long");
-
 	if (stat(db_path, &st) == -1)
 		err(1, "stat");
 
@@ -320,7 +324,7 @@ load_db()
 		errx(1, "database file permissions are incorrect; "
 		    "only the owner should have access");
 
-	cmd_fd = popen(cmd, "r");
+	cmd_fd = popen(decrypt_cmd, "r");
 	if (cmd_fd == NULL)
 		err(1, "cannot decrypt; popen");
 
@@ -337,7 +341,7 @@ load_db()
 		break;
 	default:
 		errx(1, "decrypt command failed with code %d: %s",
-		    status, cmd);
+		    status, decrypt_cmd);
 	}
 }
 
@@ -345,10 +349,16 @@ void
 save_db()
 {
 	FILE *cmd_fd;
-	char  cmd[PATH_MAX * 2];
+	char *cmd;
 	char  tmp_db_path[PATH_MAX + 1];
 	int   tmp_fd;
 	int   status;
+
+	if (encrypt_cmd == NULL) {
+		warnx("no encryption command defined; "
+		    "you cannot be able to save");
+		return;
+	}
 
 	umask(0077);
 
@@ -372,14 +382,9 @@ save_db()
 	if (debug_level)
 		warnx("created tmp save file: %s", tmp_db_path);
 
-	if (snprintf(cmd, sizeof(cmd), "%s", encrypt_cmd) >= sizeof(cmd)) {
-		warnx("encryption command was truncated; exiting");
-		unlink(tmp_db_path);
-		return;
-	}
-
-	if (!str_replace(cmd, sizeof(cmd), "%db", tmp_db_path)) {
-		warnx("cannot encrypt; command too long");
+	cmd = str_replace(encrypt_cmd, "%db", tmp_db_path);
+	if (cmd == NULL) {
+		warn("encryption command could not be computed");
 		unlink(tmp_db_path);
 		return;
 	}
@@ -391,6 +396,7 @@ save_db()
 	if (cmd_fd == NULL) {
 		warn("cannot encrypt; popen");
 		unlink(tmp_db_path);
+		free(cmd);
 		return;
 	}
 
@@ -398,6 +404,7 @@ save_db()
 		warn("could not prepare JSON output");
 		unlink(tmp_db_path);
 		pclose(cmd_fd);
+		free(cmd);
 		return;
 	}
 
@@ -405,15 +412,17 @@ save_db()
 	switch (status) {
 	case -1:
 		warn("could not properly close file: %s", db_path);
+		free(cmd);
 		return;
 	case 0:
 		break;
 	default:
-		warnx("encrypt command failed with code %d: '%s'",
-		    status, cmd);
+		warnx("encrypt command failed with code %d: '%s'", status, cmd);
+		free(cmd);
 		return;
 	}
 
+	free(cmd);
 
 	/* We only do this once per run, even if we save multiple times */
 	if (!db_backup_done) {
@@ -537,6 +546,11 @@ paste(json_t *obj)
 
 	if (obj == NULL) {
 		printf("secret not found\n");
+		return;
+	}
+
+	if (paste_cmd == NULL) {
+		warnx("no paste command defined");
 		return;
 	}
 
