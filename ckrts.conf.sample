@@ -1,8 +1,8 @@
 # The encrypted password database. Must be owned by the user, and mode 0600.
-db_path: /home/plalonde/prog/ckrts/ckrts.json.gpg
+db_path: /home/plalonde/prog/ckrts/ckrts.json.sample.gpg
 
 # Before saving, move the previous database to this location.
-backup_db_path: /home/plalonde/prog/ckrts/ckrts.json.gpg~
+backup_db_path: /home/plalonde/prog/ckrts/ckrts.json.sample.gpg~
 
 # Save the database each time a change (add, change, delete) is made.
 autosave: yes
@@ -16,8 +16,11 @@ timeout: 300
 # from STDIN and has to support output to a specific file. The output file
 # will be supplied by the program, where the '%db' token appears.
 # It is recommended, for security, that the command also signs the database
-# to ensure we are not dealing with a fake.
-encrypt_cmd: /usr/bin/gpg --yes -se -r E88745AD520A18E413DEF177490D6CABAB7D272D -o %db -
+# to ensure we are not dealing with a fake, e.g.
+#   $ gpg --yes -se -r <key id> -o %db -
+#
+# The following is insecure, but convenient as an example:
+encrypt_cmd: /usr/bin/gpg --yes --batch -c --passphrase 'ckrts' -o %db -
 
 # Decryption command. The command must write the decrypted output to STDOUT.
 # The file to decrypt will be passed by the program, where the '%db' token
