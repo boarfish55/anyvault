@@ -19,6 +19,9 @@ timeout: 300
 # to ensure we are not dealing with a fake, e.g.
 #   $ gpg --yes -se -r <key id> -o %db -
 #
+# Note that GnuPG might very well require to set the GPG_TTY environment
+# variable if running from a terminal.
+#
 # The following is insecure, but convenient as an example:
 encrypt_cmd: /usr/bin/gpg --yes --batch -c --passphrase 'ckrts' -o %db -
 
