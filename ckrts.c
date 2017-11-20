@@ -462,26 +462,27 @@ cmp_key(const void *p1, const void *p2)
 	return strcmp(*(const char **)p1, *(const char **)p2);
 }
 
-void
-list_secrets(const char *pattern)
+const char **
+get_secret_names(const char *pattern)
 {
 	void        *iter;
-	size_t       key;
-	size_t       n_keys;
+	size_t       n_keys = 0;
 	size_t       n_keys_max;
 	const char **keys, **new_keys;
 	const char  *name;
 
 	n_keys_max = json_object_size(get_secrets()) * 2;
 
-	keys = locked_mem(n_keys_max * sizeof(char *));
+	// Add an extra sizeof(char*) to make room for the last NULL
+	keys = locked_mem(n_keys_max * sizeof(char *) + sizeof(char *));
 	if (keys == NULL)
-		return;
+		return NULL;
 
 	for (iter = json_object_iter(get_secrets()); iter != NULL;
 	    iter = json_object_iter_next(get_secrets(), iter)) {
 		if (n_keys > n_keys_max) {
-			new_keys = locked_mem(n_keys_max * 2 * sizeof(char *));
+			new_keys = locked_mem(n_keys_max * 2 * sizeof(char *)
+			    + sizeof(char *));
 			if (new_keys == NULL)
 				goto end;
 			memcpy(new_keys, keys, n_keys * sizeof(char *));
@@ -501,13 +502,26 @@ list_secrets(const char *pattern)
 		}
 	}
 
+	keys[n_keys] = NULL;
+
 	qsort(keys, n_keys, sizeof(char *), cmp_key);
 
-	for (key = 0; key < n_keys; key++) {
-		printf("%s\n", keys[key]);
-	}
+	return keys;
 
 end:
+	wipe_mem(keys);
+	return NULL;
+}
+
+void
+list_secrets(const char *pattern)
+{
+	const char **key, **keys = get_secret_names(pattern);
+	if (keys == NULL)
+		return;
+	for (key = keys; *key; key++) {
+		printf("%s\n", *key);
+	}
 	wipe_mem(keys);
 }
 
@@ -768,6 +782,38 @@ sig_int()
 	warnx("Interrupt sent to child processes");
 }
 
+char *
+secrets_list_generator(const char *pattern, int state)
+{
+	char               *k;
+	static const char **key, **keys;
+
+	if (!state) {
+		keys = get_secret_names(pattern);
+		key = keys;
+	}
+
+	if (keys == NULL)
+		return NULL;
+
+	while (*key) {
+		k = strdup(*key++);
+		if (k == NULL)
+			goto end;
+		return k;
+	}
+end:
+	wipe_mem(keys);
+	return NULL;
+}
+
+char **
+secrets_completion(const char *pattern, int start, int end)
+{
+	rl_attempted_completion_over = 1;
+	return rl_completion_matches(pattern, secrets_list_generator);
+}
+
 int
 main(int argc, char **argv)
 {
@@ -846,6 +892,8 @@ main(int argc, char **argv)
 	json_set_alloc_funcs(locked_mem, wipe_mem);
 
 	load_db();
+
+	rl_attempted_completion_function = secrets_completion;
 
 	while (!quit) {
 		line = readline(prompt);
