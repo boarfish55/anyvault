@@ -1,5 +1,5 @@
 PROGNAME=ckrts
-VERSION=1.1.0
+VERSION=1.1.1
 
 all: $(PROGNAME)
 
