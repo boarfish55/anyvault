@@ -113,7 +113,8 @@ wipe_mem(void *buf)
 	}
 
 end:
-	close(fd);
+	if (fd != -1)
+		close(fd);
 	if (!no_mlock) {
 		if (munlock(p, len) == -1)
 			warn("munlock");
