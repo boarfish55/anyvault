@@ -769,6 +769,7 @@ sig_handler(int sig)
 {
 	if (sig == SIGALRM)
 		warnx("timeout reached");
+	killpg(0, 15);
 	json_object_clear(db);
 	exit(0);
 }
