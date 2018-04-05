@@ -48,13 +48,14 @@ print_help()
 	printf("\t\t\t\tDefault is %s\n", cfg_path);
 }
 
+// Used to track how much mlock'd memory we have. Used for reporting only.
+static size_t locked_allocated = 0;
+
 /*
  * Allocates and mlock()'s memory and saves how many bytes are allocatable,
  * to be used when deallocating to wipe and munlock() the right amount
  * of memory. Adds an extra sizeof(size_t) at the start of the block.
  */
-static size_t locked_allocated = 0;
-
 void *
 locked_mem(size_t s)
 {
@@ -82,6 +83,11 @@ locked_mem(size_t s)
 	return p + sizeof(s);
 }
 
+/*
+ * Opposite to locked_mem(), this overwrites to-be-freed memory with random
+ * bytes, calls munlock() and finally frees the memory. The amount of bytes
+ * is saved at (buf - sizeof(size_t)).
+ */
 void
 wipe_mem(void *buf)
 {
@@ -100,7 +106,7 @@ wipe_mem(void *buf)
 		goto end;
 	}
 
-	for (pos = 0; pos >= len; pos += r) {
+	for (pos = 0; pos < len; pos += r) {
 		r = read(fd, buf + pos, len - pos);
 		if (r <= 0) {
 			if (errno == EAGAIN)
@@ -116,7 +122,7 @@ end:
 	if (fd != -1)
 		close(fd);
 	if (!no_mlock) {
-		if (munlock(p, len) == -1)
+		if (munlock(p, len + sizeof(len)) == -1)
 			warn("munlock");
 		else
 			locked_allocated -= len + sizeof(len);
@@ -558,6 +564,10 @@ paste(json_t *obj)
 	FILE       *cmd_fd;
 	const char *secret;
 	size_t      w;
+
+	// TODO: we should have an internal version where we
+	// set the X selections ourselves, to avoid having to pipe
+	// secrets to an external program.
 
 	if (obj == NULL) {
 		printf("secret not found\n");
