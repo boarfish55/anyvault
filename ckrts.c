@@ -26,6 +26,7 @@ char    bk_db_path[PATH_MAX + 1];
 int     timeout = 300;
 size_t  max_value_length = 2048;
 int     no_mlock = 0;
+int     permission_check = 1;
 int     autosave = 1;
 int     debug_level = 0;
 char   *encrypt_cmd = NULL;
@@ -46,6 +47,7 @@ print_help()
 	printf("\t-d\t\t\tIncrease debuggging output\n");
 	printf("\t-c\t<cfg path>\tUse an alternate path for the configuration;\n");
 	printf("\t\t\t\tDefault is %s\n", cfg_path);
+	printf("\t-x\t\t\tSkip permission and ownership checks (insecure)\n");
 }
 
 // Used to track how much mlock'd memory we have. Used for reporting only.
@@ -199,13 +201,15 @@ read_cfg()
 	if (fstat(fd, &st) == -1)
 		err(1, "could not stat %s", cfg_path);
 
-	if (st.st_uid != getuid())
-		errx(1, "configuration file ownership is incorrect; "
-		    "you should own it");
+	if (permission_check) {
+		if (st.st_uid != getuid())
+			errx(1, "configuration file ownership is incorrect; "
+			    "you should own it");
 
-	if (st.st_mode & (S_IRWXO|S_IRWXG))
-		errx(1, "configuration file permissions are incorrect; "
-		    "only the owner should have access");
+		if (st.st_mode & (S_IRWXO|S_IRWXG))
+			errx(1, "configuration file permissions are incorrect; "
+			    "only the owner should have access");
+	}
 
 	cfg = fdopen(fd, "r");
 	if (cfg == NULL)
@@ -320,16 +324,18 @@ load_db()
 		err(1, "cannot access database %s; "
 		    "make sure it is readable", db_path);
 
-	if (stat(db_path, &st) == -1)
-		err(1, "stat");
+	if (permission_check) {
+		if (stat(db_path, &st) == -1)
+			err(1, "stat");
 
-	if (st.st_uid != getuid())
-		errx(1, "database file ownership is incorrect; "
-		    "you should own it");
+		if (st.st_uid != getuid())
+			errx(1, "database file ownership is incorrect; "
+			    "you should own it");
 
-	if (st.st_mode & (S_IRWXO|S_IRWXG))
-		errx(1, "database file permissions are incorrect; "
-		    "only the owner should have access");
+		if (st.st_mode & (S_IRWXO|S_IRWXG))
+			errx(1, "database file permissions are incorrect; "
+			    "only the owner should have access");
+	}
 
 	cmd_fd = popen(decrypt_cmd, "r");
 	if (cmd_fd == NULL)
@@ -867,7 +873,7 @@ main(int argc, char **argv)
 	if (sigaction(SIGINT, &act, NULL) == -1)
 		err(1, "sigaction");
 
-	while ((opt = getopt(argc, argv, "dvhc:")) != -1) {
+	while ((opt = getopt(argc, argv, "xdvhc:")) != -1) {
 		switch (opt) {
 		case 'h':
 			print_help();
@@ -883,6 +889,9 @@ main(int argc, char **argv)
 		case 'v':
 			printf("%s version %s\n", PROGNAME, VERSION);
 			exit(0);
+		case 'x':
+			permission_check = 0;
+			break;
 		default:
 			print_help();
 			exit(1);
