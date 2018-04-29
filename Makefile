@@ -12,5 +12,15 @@ $(PROGNAME): $(PROGNAME).c
 		-lreadline \
 		-Wall
 
+$(PROGNAME)-static: $(PROGNAME).c
+	gcc -static -DPROGNAME=\"$(PROGNAME)\" \
+		-DVERSION=\"$(VERSION)\" \
+		-D_GNU_SOURCE \
+		$(PROGNAME).c -g \
+		-o $(PROGNAME)-static \
+		-lreadline -lncurses -ltinfo \
+		`pkg-config --static --libs 'jansson >= 2.9'` \
+		-Wall
+
 clean:
-	rm -f $(PROGNAME) *.o
+	rm -f $(PROGNAME) $(PROGNAME)-static *.o
