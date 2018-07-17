@@ -414,7 +414,7 @@ save_db()
 	}
 
 	if (json_dumpf(db, cmd_fd, JSON_INDENT(2) | JSON_SORT_KEYS) == -1) {
-		warn("could not prepare JSON output");
+		warnx("could not prepare JSON output while saving");
 		unlink(tmp_db_path);
 		pclose(cmd_fd);
 		free(cmd);
@@ -680,7 +680,7 @@ read_field(const char *name, int echo)
 	return input;
 }
 
-void
+int
 add_secret(const char *key, int overwrite)
 {
 	json_t      *s;
@@ -689,7 +689,7 @@ add_secret(const char *key, int overwrite)
 
 	if (find_secret(key) && !overwrite) {
 		printf("secret already exists\n");
-		return;
+		return 0;
 	}
 
 	if (!overwrite) {
@@ -698,7 +698,7 @@ add_secret(const char *key, int overwrite)
 		s = json_object_get(get_secrets(), key);
 		if (s == NULL) {
 			printf("couldn't get secret %s\n", key);
-			return;
+			return 0;
 		}
 	}
 
@@ -740,7 +740,7 @@ add_secret(const char *key, int overwrite)
 	show_secret(s, 1);
 
 	if (!confirm("[Y/n]:", 1))
-		return;
+		return 0;
 
 	if (!overwrite)
 		json_object_set_new(get_secrets(), key, s);
@@ -749,19 +749,64 @@ add_secret(const char *key, int overwrite)
 		printf("Changed %s\n", key);
 	else
 		printf("Added %s\n", key);
+
+	return 1;
 }
 
-void
+int
 delete_secret(const char *key)
 {
 	if (key == NULL)
-		return;
+		return 0;
 
 	if (!confirm("Are you sure [y/N]:", 0))
-		return;
+		return 0;
 
 	json_object_del(get_secrets(), key);
 	printf("Deleted %s\n", key);
+	return 1;
+}
+
+int
+rename_secret(const char *old_key)
+{
+	json_t      *old, *new;
+	char        *new_key;
+
+	old = json_object_get(get_secrets(), old_key);
+	if (old == NULL) {
+		printf("couldn't get secret %s\n", old_key);
+		return 0;
+	}
+
+	new_key = read_field("New secret name", 1);
+	if (find_secret(new_key)) {
+		printf("secret already exists\n");
+		wipe_mem(new_key);
+		return 0;
+	}
+
+	new = json_object();
+
+	if (json_object_update(new, old) == -1) {
+		warnx("failed to copy JSON object");
+		wipe_mem(new_key);
+		return 0;
+	}
+
+	if (json_object_set_new(get_secrets(), new_key, new) == -1) {
+		warnx("failed to set new JSON object");
+		wipe_mem(new_key);
+		return 0;
+	}
+
+	if (json_object_del(get_secrets(), old_key) == -1) {
+		warnx("failed to delete old JSON object");
+	}
+
+	printf("renamed '%s' to '%s'\n", old_key, new_key);
+	wipe_mem(new_key);
+	return 1;
 }
 
 void
@@ -941,30 +986,33 @@ main(int argc, char **argv)
 				printf("Usage: add [secret name]\n");
 				goto again;
 			}
-			add_secret(token, 0);
-			db_modified = 1;
-			if (autosave)
-				save_db();
+			if (add_secret(token, 0)) {
+				db_modified = 1;
+				if (autosave)
+					save_db();
+			}
 		} else if (strcmp(token, "change") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
 				printf("Usage: change [secret name]\n");
 				goto again;
 			}
-			add_secret(token, 1);
-			db_modified = 1;
-			if (autosave)
-				save_db();
+			if (add_secret(token, 1)) {
+				db_modified = 1;
+				if (autosave)
+					save_db();
+			}
 		} else if (strcmp(token, "delete") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
 				printf("Usage: delete [secret name]\n");
 				goto again;
 			}
-			delete_secret(token);
-			db_modified = 1;
-			if (autosave)
-				save_db();
+			if (delete_secret(token)) {
+				db_modified = 1;
+				if (autosave)
+					save_db();
+			}
 		} else if (strcmp(token, "help") == 0) {
 			printf("Help: add, change, delete, help, list, paste, quit, save, show, showall\n");
 		} else if (strcmp(token, "list") == 0) {
@@ -975,6 +1023,17 @@ main(int argc, char **argv)
 			if (token == NULL)
 				goto again;
 			paste(find_secret(token));
+		} else if (strcmp(token, "rename") == 0) {
+			token = strtok(NULL, " ");
+			if (token == NULL) {
+				printf("Usage: rename [secret name]\n");
+				goto again;
+			}
+			if (rename_secret(token)) {
+				db_modified = 1;
+				if (autosave)
+					save_db();
+			}
 		} else if (strcmp(token, "quit") == 0) {
 			if (db_modified) {
 				if (confirm("Changes were made; "
