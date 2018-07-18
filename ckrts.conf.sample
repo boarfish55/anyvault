@@ -4,9 +4,6 @@ db_path: /home/plalonde/prog/ckrts/ckrts.json.sample.gpg
 # Before saving, move the previous database to this location.
 backup_db_path: /home/plalonde/prog/ckrts/ckrts.json.sample.gpg~
 
-# Save the database each time a change (add, change, delete) is made.
-autosave: yes
-
 # After this timeout, the database will be automatically saved and the program
 # will exit. This should be set to a value lower than the TTL of any agent
 # retaining secret keys, such as gpg-agent.
@@ -23,13 +20,13 @@ timeout: 300
 # variable if running from a terminal.
 #
 # The following is insecure, but convenient as an example:
-encrypt_cmd: /usr/bin/gpg --yes --batch -c --passphrase 'ckrts' -o %db -
+encrypt_cmd: /usr/bin/gpg --yes --no-tty --batch -c --passphrase 'ckrts' -o %db -
 
 # Decryption command. The command must write the decrypted output to STDOUT.
 # The file to decrypt will be passed by the program, where the '%db' token
 # appears. It is recommended that the decryption command also verifies
 # signatures on the database to ensure we are not dealing with a fake.
-decrypt_cmd: /usr/bin/gpg --decrypt %db
+decrypt_cmd: /usr/bin/gpg -q --no-tty --batch --decrypt %db
 
 # Command to paste secrets to the clipboard. The command has to read the
 # secret from STDIN. Ideally, it should not keep the secret forever.

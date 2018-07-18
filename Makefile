@@ -1,7 +1,11 @@
 PROGNAME=ckrts
-VERSION=1.1.5
+VERSION=1.2
 
 all: $(PROGNAME)
+
+# Be careful with optimization options. We must make sure nothing will try
+# to elimitate the memory wiping code, since the buffer is freed shortly
+# after.
 
 $(PROGNAME): $(PROGNAME).c
 	gcc -DPROGNAME=\"$(PROGNAME)\" \
