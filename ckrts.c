@@ -27,14 +27,13 @@ int     timeout = 300;
 size_t  max_value_length = 2048;
 int     no_mlock = 0;
 int     permission_check = 1;
-int     autosave = 1;
+int     enable_core = 0;
 int     debug_level = 0;
 char   *encrypt_cmd = NULL;
 char   *decrypt_cmd = NULL;
 char   *paste_cmd = NULL;
 
 int                 db_backup_done = 0;
-int                 db_modified = 0;
 json_t             *db;
 const char         *fields[] = { "notes", "url", "login", "secret", NULL };
 
@@ -48,6 +47,7 @@ print_help()
 	printf("\t-c\t<cfg path>\tUse an alternate path for the configuration;\n");
 	printf("\t\t\t\tDefault is %s\n", cfg_path);
 	printf("\t-x\t\t\tSkip permission and ownership checks (insecure)\n");
+	printf("\t-X\t\t\tDon't disable core dump creation (insecure)\n");
 }
 
 // Used to track how much mlock'd memory we have. Used for reporting only.
@@ -98,6 +98,9 @@ wipe_mem(void *buf)
 	size_t   pos;
 	size_t   len;
 	void    *p;
+
+	if (buf == NULL)
+		return;
 
 	p = buf - sizeof(len);
 	len = *((size_t *)p);
@@ -273,13 +276,6 @@ read_cfg()
 				no_mlock = 1;
 			else
 				warnx("no_mlock must be 'yes' or 'no'");
-		} else if (strcmp(p, "autosave") == 0) {
-			if (strcmp(v, "yes") == 0)
-				autosave = 1;
-			else if (strcmp(v, "no") == 0)
-				autosave = 0;
-			else
-				warnx("autosave must be 'yes' or 'no'");
 		} else if (strcmp(p, "max_value_length") == 0) {
 			if (atoi(v) < 0)
 				warnx("invalid max_value_length specified; "
@@ -314,6 +310,7 @@ load_db()
 	int           status;
 	struct stat   st;
 	json_error_t  error;
+	char         *iobuf;
 
 	if (access(db_path, F_OK) == -1) {
 		warnx("database %s does not exist; will create", db_path);
@@ -341,12 +338,20 @@ load_db()
 	if (cmd_fd == NULL)
 		err(1, "cannot decrypt; popen");
 
+	iobuf = locked_mem(BUFSIZ);
+	if (iobuf == NULL)
+		err(1, "load_db");
+	setbuf(cmd_fd, iobuf);
+
 	db = json_loadf(cmd_fd, JSON_REJECT_DUPLICATES, &error);
-	if (db == NULL)
+	if (db == NULL) {
+		wipe_mem(iobuf);
 		errx(1, "JSON parse error (line %d): %s\n",
 		    error.line, error.text);
+	}
 
 	status = pclose(cmd_fd);
+	wipe_mem(iobuf);
 	switch (status) {
 	case -1:
 		err(1, "popen");
@@ -359,6 +364,13 @@ load_db()
 }
 
 void
+clear_db()
+{
+	if (json_object_clear(db) == -1)
+		warnx("failed to clear in-memory JSON database");
+}
+
+void
 save_db()
 {
 	FILE *cmd_fd;
@@ -366,6 +378,7 @@ save_db()
 	char  tmp_db_path[PATH_MAX + 1];
 	int   tmp_fd;
 	int   status;
+	char *iobuf;
 
 	if (encrypt_cmd == NULL) {
 		warnx("no encryption command defined; "
@@ -413,15 +426,24 @@ save_db()
 		return;
 	}
 
+	iobuf = locked_mem(BUFSIZ);
+	if (iobuf == NULL) {
+		warnx("save_db");
+		return;
+	}
+	setbuf(cmd_fd, iobuf);
+
 	if (json_dumpf(db, cmd_fd, JSON_INDENT(2) | JSON_SORT_KEYS) == -1) {
 		warnx("could not prepare JSON output while saving");
 		unlink(tmp_db_path);
 		pclose(cmd_fd);
+		wipe_mem(iobuf);
 		free(cmd);
 		return;
 	}
 
 	status = pclose(cmd_fd);
+	wipe_mem(iobuf);
 	switch (status) {
 	case -1:
 		warn("could not properly close file: %s", db_path);
@@ -453,7 +475,6 @@ save_db()
 		warnx("successfully saved; renaming %s to %s",
 		    tmp_db_path, db_path);
 
-	db_modified = 0;
 	warnx("changes were saved to %s", db_path);
 }
 
@@ -570,6 +591,8 @@ paste(json_t *obj)
 	FILE       *cmd_fd;
 	const char *secret;
 	size_t      w;
+	char       *iobuf;
+	int         status;
 
 	// TODO: we should have an internal version where we
 	// set the X selections ourselves, to avoid having to pipe
@@ -591,19 +614,32 @@ paste(json_t *obj)
 		return;
 	}
 
+	iobuf = locked_mem(BUFSIZ);
+	if (iobuf == NULL) {
+		warnx("paste");
+		return;
+	}
+	setbuf(cmd_fd, iobuf);
+
 	v = json_object_get(obj, "secret");
 	if (v == NULL) {
 		warnx("could not get secret");
 		pclose(cmd_fd);
+		wipe_mem(iobuf);
 		return;
 	}
-	secret = json_string_value(v);
+	if ((secret = json_string_value(v)) == NULL) {
+		warnx("invalid JSON string for secret");
+	} else {
+		w = fwrite(secret, 1, strlen(secret), cmd_fd);
+		if (w < strlen(secret))
+			warn("failed to write to paste command; "
+			    "write count: %lu", w);
+	}
 
-	w = fwrite(secret, 1, strlen(secret), cmd_fd);
-	if (w < strlen(secret))
-		warn("failed to write to paste command; write count: %lu", w);
-
-	switch (pclose(cmd_fd)) {
+	status = pclose(cmd_fd);
+	wipe_mem(iobuf);
+	switch (status) {
 	case -1:
 		warn("paste command failed");
 	case 0:
@@ -653,26 +689,36 @@ read_field(const char *name, int echo)
 	fflush(stdout);
 
 	if (!echo) {
-		if (tcgetattr(0, &saved_ts) == -1)
-			err(1, "cannot get terminal settings");
+		if (tcgetattr(0, &saved_ts) == -1) {
+			warn("cannot get terminal settings");
+			return NULL;
+		}
 
 		new_ts = saved_ts;
 		new_ts.c_lflag &= ~ECHO;
 
-		if (tcsetattr(0, TCSANOW, &new_ts) == -1)
-			err(1, "cannot set terminal settings");
+		if (tcsetattr(0, TCSANOW, &new_ts) == -1) {
+			warn("cannot set terminal settings");
+			return NULL;
+		}
 	}
 
 	input = locked_mem(max_value_length);
-	if (input == NULL)
-		err(1, "could not read field");
+	if (input == NULL) {
+		warn("could not read field");
+		return NULL;
+	}
 
-	if (fgets(input, max_value_length + 1, stdin) == NULL)
-		err(1, "fgets");
+	if (fgets(input, max_value_length + 1, stdin) == NULL) {
+		warn("fgets");
+		return NULL;
+	}
 
 	if (!echo) {
-		if (tcsetattr(0, TCSANOW, &saved_ts) == -1)
-			err(1, "cannot reset terminal settings");
+		if (tcsetattr(0, TCSANOW, &saved_ts) == -1) {
+			warn("cannot reset terminal settings");
+			return NULL;
+		}
 		printf("\n");
 	}
 
@@ -683,21 +729,24 @@ read_field(const char *name, int echo)
 int
 add_secret(const char *key, int overwrite)
 {
-	json_t      *s;
+	json_t      *s, *old;
 	char        *input, *input2;
 	const char **f;
 
 	if (find_secret(key) && !overwrite) {
-		printf("secret already exists\n");
+		warnx("secret already exists\n");
 		return 0;
 	}
 
-	if (!overwrite) {
-		s = json_object();
-	} else {
-		s = json_object_get(get_secrets(), key);
+	s = json_object();
+	if (overwrite) {
+		old = json_object_get(get_secrets(), key);
 		if (s == NULL) {
-			printf("couldn't get secret %s\n", key);
+			warnx("couldn't get secret %s\n", key);
+			return 0;
+		}
+		if (json_object_update(s, old) == -1) {
+			warnx("failed to update temporary JSON object");
 			return 0;
 		}
 	}
@@ -710,8 +759,15 @@ add_secret(const char *key, int overwrite)
 		}
 		if (strcmp(*f, "secret") == 0) {
 			for (;;) {
-				input = read_field("secret", 0);
-				input2 = read_field("confirm secret", 0);
+				if ((input = read_field("secret", 0)) == NULL)
+					return 0;
+
+				if ((input2 = read_field("confirm secret", 0))
+				    == NULL) {
+					wipe_mem(input);
+					return 0;
+				}
+
 				if (strcmp(input, input2) == 0) {
 					wipe_mem(input2);
 					break;
@@ -720,13 +776,17 @@ add_secret(const char *key, int overwrite)
 				printf("secrets don't match; try again\n");
 			}
 		} else {
-			input = read_field(*f, 1);
+			if ((input = read_field(*f, 1)) == NULL)
+				return 0;
 		}
 
-		if (overwrite)
-			json_object_del(s, *f);
+		if (json_object_set_new(s, *f, json_string(input)) == -1) {
+			warnx("failed to add field %s to temporary "
+			    "JSON object", *f);
+			wipe_mem(input);
+			return 0;
+		}
 
-		json_object_set_new(s, *f, json_string(input));
 		wipe_mem(input);
 	}
 
@@ -742,8 +802,17 @@ add_secret(const char *key, int overwrite)
 	if (!confirm("[Y/n]:", 1))
 		return 0;
 
-	if (!overwrite)
-		json_object_set_new(get_secrets(), key, s);
+	if (overwrite) {
+		if (json_object_update(old, s) == -1) {
+			warnx("failed to overwrite current entry");
+			return 0;
+		}
+	} else {
+		if (json_object_set_new(get_secrets(), key, s) == -1) {
+			warnx("failed to add new entry");
+			return 0;
+		}
+	}
 
 	if (overwrite)
 		printf("Changed %s\n", key);
@@ -762,7 +831,11 @@ delete_secret(const char *key)
 	if (!confirm("Are you sure [y/N]:", 0))
 		return 0;
 
-	json_object_del(get_secrets(), key);
+	if (json_object_del(get_secrets(), key) == -1) {
+		warnx("failed to delete key");
+		return 0;
+	}
+
 	printf("Deleted %s\n", key);
 	return 1;
 }
@@ -817,8 +890,10 @@ reset_timer()
 	memset(&exit_timer, 0, sizeof(exit_timer));
 	exit_timer.it_value.tv_sec = timeout;
 
-	if (setitimer(ITIMER_REAL, &exit_timer, NULL) == -1)
-		err(1, "setitimer");
+	if (setitimer(ITIMER_REAL, &exit_timer, NULL) == -1) {
+		warn("setitimer");
+		return;
+	}
 
 	if (debug_level)
 		warnx("timer set to exit in %lu seconds",
@@ -831,7 +906,7 @@ sig_handler(int sig)
 	if (sig == SIGALRM)
 		warnx("timeout reached");
 	killpg(0, 15);
-	json_object_clear(db);
+	clear_db();
 	exit(0);
 }
 
@@ -851,13 +926,15 @@ secrets_list_generator(const char *pattern, int state)
 	char               *k;
 	static const char **key, **keys;
 
+
 	if (!state) {
+		load_db();
 		keys = get_secret_names(pattern);
 		key = keys;
 	}
 
 	if (keys == NULL)
-		return NULL;
+		goto end;
 
 	while (*key) {
 		k = strdup(*key++);
@@ -866,6 +943,7 @@ secrets_list_generator(const char *pattern, int state)
 		return k;
 	}
 end:
+	clear_db();
 	wipe_mem(keys);
 	return NULL;
 }
@@ -918,7 +996,7 @@ main(int argc, char **argv)
 	if (sigaction(SIGINT, &act, NULL) == -1)
 		err(1, "sigaction");
 
-	while ((opt = getopt(argc, argv, "xdvhc:")) != -1) {
+	while ((opt = getopt(argc, argv, "Xxdvhc:")) != -1) {
 		switch (opt) {
 		case 'h':
 			print_help();
@@ -937,6 +1015,9 @@ main(int argc, char **argv)
 		case 'x':
 			permission_check = 0;
 			break;
+		case 'X':
+			enable_core = 1;
+			break;
 		default:
 			print_help();
 			exit(1);
@@ -952,26 +1033,20 @@ main(int argc, char **argv)
 
 	warnx("timeout set to %d seconds", timeout);
 
-	if (setrlimit(RLIMIT_CORE, &no_core) == -1)
-		warn("could not disable core dumps; setrlimit");
+	if (!enable_core) {
+		if (setrlimit(RLIMIT_CORE, &no_core) == -1)
+			warn("could not disable core dumps; setrlimit");
+	}
 
 	json_set_alloc_funcs(locked_mem, wipe_mem);
-
-	load_db();
 
 	rl_attempted_completion_function = secrets_completion;
 
 	while (!quit) {
 		line = readline(prompt);
 		reset_timer();
-		if (line == NULL) {
-			if (db_modified) {
-				printf("Changes were made; either save or "
-				    "use quit\n");
-				continue;
-			} else
-				break;
-		}
+		if (line == NULL)
+			break;
 
 		if (*line)
 			add_history(line);
@@ -986,82 +1061,76 @@ main(int argc, char **argv)
 				printf("Usage: add [secret name]\n");
 				goto again;
 			}
-			if (add_secret(token, 0)) {
-				db_modified = 1;
-				if (autosave)
-					save_db();
-			}
+			load_db();
+			if (add_secret(token, 0))
+				save_db();
+			clear_db();
 		} else if (strcmp(token, "change") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
 				printf("Usage: change [secret name]\n");
 				goto again;
 			}
-			if (add_secret(token, 1)) {
-				db_modified = 1;
-				if (autosave)
-					save_db();
-			}
+			load_db();
+			if (add_secret(token, 1))
+				save_db();
+			clear_db();
 		} else if (strcmp(token, "delete") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
 				printf("Usage: delete [secret name]\n");
 				goto again;
 			}
-			if (delete_secret(token)) {
-				db_modified = 1;
-				if (autosave)
-					save_db();
-			}
+			load_db();
+			if (delete_secret(token))
+				save_db();
+			clear_db();
 		} else if (strcmp(token, "help") == 0) {
-			printf("Help: add, change, delete, help, list, paste, quit, save, show, showall\n");
+			printf("Help: add, change, delete, help, list, paste, quit, show, showall\n");
 		} else if (strcmp(token, "list") == 0) {
 			token = strtok(NULL, " ");
+			load_db();
 			list_secrets(token);
+			clear_db();
 		} else if (strcmp(token, "paste") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL)
 				goto again;
+			load_db();
 			paste(find_secret(token));
+			clear_db();
 		} else if (strcmp(token, "rename") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL) {
 				printf("Usage: rename [secret name]\n");
 				goto again;
 			}
-			if (rename_secret(token)) {
-				db_modified = 1;
-				if (autosave)
-					save_db();
-			}
+			load_db();
+			if (rename_secret(token))
+				save_db();
+			clear_db();
 		} else if (strcmp(token, "quit") == 0) {
-			if (db_modified) {
-				if (confirm("Changes were made; "
-				    "exit without saving? [y/N]", 0))
-					quit = 1;
-			} else {
-				quit = 1;
-			}
-		} else if (strcmp(token, "save") == 0) {
-			save_db();
+			quit = 1;
 		} else if (strcmp(token, "showall") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL)
 				goto again;
+			load_db();
 			show_secret(find_secret(token), 0);
+			clear_db();
 		} else if (strcmp(token, "show") == 0) {
 			token = strtok(NULL, " ");
 			if (token == NULL)
 				goto again;
+			load_db();
 			show_secret(find_secret(token), 1);
+			clear_db();
 		} else {
 			printf("unknown command\n");
 		}
 again:
 		free(line);
 	}
-
-	json_object_clear(db);
 
 	printf("Bye.\n");
 	return 0;
