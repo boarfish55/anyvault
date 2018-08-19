@@ -587,12 +587,13 @@ show_secret(json_t *obj, int hide_secret)
 void
 paste(json_t *obj)
 {
-	json_t     *v;
-	FILE       *cmd_fd;
-	const char *secret;
-	size_t      w;
-	char       *iobuf;
-	int         status;
+	json_t      *v;
+	const char **f;
+	FILE        *cmd_fd;
+	const char  *secret;
+	size_t       w;
+	char        *iobuf;
+	int          status;
 
 	// TODO: we should have an internal version where we
 	// set the X selections ourselves, to avoid having to pipe
@@ -606,6 +607,13 @@ paste(json_t *obj)
 	if (paste_cmd == NULL) {
 		warnx("no paste command defined");
 		return;
+	}
+
+	for (f = fields; *f; f++) {
+		if (strcmp(*f, "secret") == 0)
+			continue;
+		if ((v = json_object_get(obj, *f)))
+			printf("%s: %s\n", *f, json_string_value(v));
 	}
 
 	cmd_fd = popen(paste_cmd, "w");
