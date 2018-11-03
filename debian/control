@@ -1,0 +1,13 @@
+Source: ckrts
+Section: misc
+Priority: optional
+Maintainer: Pascal Lalonde <plalonde@overnet.ca>
+Build-Depends: debhelper (>= 9), libjansson-dev (>= 2.9), libreadline-dev
+Standards-Version: 3.9.8
+
+Package: ckrts
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: A text-based secrets manager
+ A text-based secrets manager, which stores secrets in a JSON file and
+ uses standard command-line tools for encryption and decryption.
