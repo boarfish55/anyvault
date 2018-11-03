@@ -1,0 +1,45 @@
+ckrts(1) -- A text-based secrets manager
+========================================
+
+## SYNOPSIS
+
+`ckrts` [-hvdxX] [-c &lt;cfg&gt;]
+
+## DESCRIPTION
+
+A text-based secrets manager, which stores secrets in a JSON file and
+uses standard command-line tools for encryption and decryption.
+
+For encryption and decryption, and external command is used, typically
+GnuPG, as this can benefit from having the gpg-agent running to keep
+the passphrase loaded and sign/encrypt the database when exiting.
+
+## CONFIGURATION FILE
+
+The configuration file, which must be owned by the user running ckrts,
+can contain the following directives:
+
+    # Stuff
+    db_path:
+    backup_db_path:
+    timeout:
+    encrypt_cmd:
+    decrypt_cmd:
+    paste_cmd:
+    mlock:
+    max_value_length:
+
+## FILES
+
+_~/ckrts.conf_
+The default configuration file path.
+
+_~/.ckrts.json.gpg_
+The default secrets database path.
+
+_/usr/share/doc/ckrts/examples/ckrts.conf.sample_
+A sample configuration file with sane defaults.
+
+## AUTHOR
+
+Pascal Lalonde &lt;plalonde@overnet.ca&gt;

@@ -1,7 +1,9 @@
 PROGNAME=ckrts
 VERSION=1.2.1
+DESTDIR=
+prefix=~
 
-all: $(PROGNAME)
+all: $(PROGNAME) $(PROGNAME).1
 
 # Be careful with optimization options. We must make sure nothing will try
 # to elimitate the memory wiping code, since the buffer is freed shortly
@@ -26,5 +28,11 @@ $(PROGNAME)-static: $(PROGNAME).c
 		`pkg-config --static --libs 'jansson >= 2.9'` \
 		-Wall
 
+$(PROGNAME).1: $(PROGNAME).1.ronn
+	ronn -r $(PROGNAME).1.ronn
+
+install: $(PROGNAME)
+	install -D -m 0755 -s $(PROGNAME) $(DESTDIR)$(prefix)/bin/$(PROGNAME)
+
 clean:
-	rm -f $(PROGNAME) $(PROGNAME)-static *.o
+	rm -f $(PROGNAME) $(PROGNAME)-static *.o $(PROGNAME).1
