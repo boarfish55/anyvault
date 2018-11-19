@@ -4,6 +4,8 @@ encryption/decryption command (such as GnuPG).
 Dependencies:
 - libjansson-dev >= 2.9
 - libreadline-dev
+- pkg-config
+- Ruby ronn
 
 To build:
 $ make
