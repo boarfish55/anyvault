@@ -17,6 +17,9 @@
 #include <readline/history.h>
 #include <jansson.h>
 
+#include <X11/Xlib.h>
+#include <X11/XKBlib.h>
+
 const char  program_name[] = PROGNAME;
 const char *version = VERSION;
 
@@ -33,9 +36,9 @@ char   *encrypt_cmd = NULL;
 char   *decrypt_cmd = NULL;
 char   *paste_cmd = NULL;
 
-int                 db_backup_done = 0;
-json_t             *db;
-const char         *fields[] = { "notes", "url", "login", "secret", NULL };
+int         db_backup_done = 0;
+json_t     *db;
+const char *fields[] = { "notes", "url", "login", "secret", NULL };
 
 void
 print_help()
@@ -301,6 +304,46 @@ read_cfg()
 		warnx("no paste command defined");
 
 	fclose(cfg);
+}
+
+void
+xsetup()
+{
+	Display         *xdpy;
+	int              min_kc, max_kc, ks_per_kc;
+	const char      *d = getenv("DISPLAY");
+	XModifierKeymap *modmap;
+	KeySym          *keysyms;
+	XkbStateRec      kb_state;
+
+	if ((xdpy = XOpenDisplay(d)) == NULL)
+		err(1, "can't open display: %s\n", d);
+
+	XDisplayKeycodes(xdpy, &min_kc, &max_kc);
+	modmap = XGetModifierMapping(xdpy);
+
+	keysyms = XGetKeyboardMapping(xdpy, min_kc, max_kc - min_kc + 1,
+	    &ks_per_kc);
+
+
+	XkbGetState(xdpy, XkbUseCoreKbd, &kb_state);
+
+	//XkbLockGroup(xdpy, XkbUseCoreKbd, key->group);
+	//if (mask)
+	//	_xdo_send_modifier(xdo, mask, is_press);
+
+	//printf("XTEST: Sending key %d %s %x %d\n", key->code, is_press ? "down" : "up", key->modmask, key->group);
+
+	//XTestFakeKeyEvent(xdo->xdpy, key->code, is_press, CurrentTime);
+	//XkbLockGroup(xdo->xdpy, XkbUseCoreKbd, current_group);
+
+	XSync(xdpy, False);
+
+	XFree(keysyms);
+	XFreeModifiermap(modmap);
+
+	XFlush(xdpy);
+	usleep(20000);
 }
 
 void
@@ -650,10 +693,14 @@ paste(json_t *obj)
 	switch (status) {
 	case -1:
 		warn("paste command failed");
+		break;
+	case 130:
+		warnx("paste command ended");
+		break;
 	case 0:
 		break;
 	default:
-		warnx("paste command failed");
+		warnx("paste command failed with status %d", status);
 	}
 }
 
@@ -1047,6 +1094,8 @@ main(int argc, char **argv)
 	}
 
 	json_set_alloc_funcs(locked_mem, wipe_mem);
+
+	xsetup();
 
 	rl_attempted_completion_function = secrets_completion;
 
