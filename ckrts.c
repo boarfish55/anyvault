@@ -37,7 +37,7 @@ char   *decrypt_cmd = NULL;
 char   *paste_cmd = NULL;
 
 int         db_backup_done = 0;
-json_t     *db;
+json_t     *db = NULL;
 const char *fields[] = { "notes", "url", "login", "secret", NULL };
 
 void
