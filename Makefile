@@ -34,5 +34,8 @@ $(PROGNAME).1: $(PROGNAME).1.ronn
 install: $(PROGNAME)
 	install -D -m 0755 -s $(PROGNAME) $(DESTDIR)$(prefix)/bin/$(PROGNAME)
 
+deb:
+	dpkg-buildpackage -Zgzip -i -I
+
 clean:
 	rm -f $(PROGNAME) $(PROGNAME)-static *.o $(PROGNAME).1
