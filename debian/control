@@ -2,7 +2,7 @@ Source: ckrts
 Section: misc
 Priority: optional
 Maintainer: Pascal Lalonde <plalonde@overnet.ca>
-Build-Depends: debhelper (>= 9), libjansson-dev (>= 2.9), libreadline-dev, pkg-config, ruby-ronn
+Build-Depends: debhelper (>= 9), libjansson-dev (>= 2.9), libreadline-dev, pkg-config, ronn
 Standards-Version: 3.9.8
 
 Package: ckrts
