@@ -1,11 +1,11 @@
 ckrts lets you manage a JSON database of secrets using an external
 encryption/decryption command (such as GnuPG).
 
-Dependencies:
-- libjansson-dev >= 2.9
-- libreadline-dev
+Dependencies (w/license):
+- libjansson-dev >= 2.9 (Expat)
+- libreadline-dev (GPL-3)
 - pkg-config
-- Ruby ronn
+- Ruby ronn (Expat)
 
 To build:
 $ make

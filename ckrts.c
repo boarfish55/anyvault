@@ -1,3 +1,21 @@
+/*
+ *  ckrts -- a command-line password manager.
+ *
+ *  Copyright (C) 2019 Pascal Lalonde
+ *
+ *  This program is free software: you can redistribute it and/or modify
+ *  it under the terms of the GNU General Public License as published by
+ *  the Free Software Foundation, either version 3 of the License, or
+ *  (at your option) any later version.
+ *
+ *  This program is distributed in the hope that it will be useful,
+ *  but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *  MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *  GNU General Public License for more details.
+ *
+ *  You should have received a copy of the GNU General Public License
+ *  along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
 #include <sys/mman.h>
 #include <sys/resource.h>
 #include <sys/stat.h>
@@ -18,7 +36,9 @@
 #include <jansson.h>
 
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <X11/XKBlib.h>
+#include <X11/extensions/XTest.h>
 
 const char  program_name[] = PROGNAME;
 const char *version = VERSION;
@@ -39,6 +59,8 @@ char   *paste_cmd = NULL;
 int         db_backup_done = 0;
 json_t     *db = NULL;
 const char *fields[] = { "notes", "url", "login", "secret", NULL };
+
+void save_db();
 
 void
 print_help()
@@ -357,6 +379,12 @@ load_db()
 
 	if (access(db_path, F_OK) == -1) {
 		warnx("database %s does not exist; will create", db_path);
+		db = json_object();
+		if (json_object_set_new(db, "secrets", json_object()) == -1) {
+			warnx("failed to set new JSON object");
+			return;
+		}
+		save_db();
 		return;
 	}
 
@@ -628,6 +656,110 @@ show_secret(json_t *obj, int hide_secret)
 }
 
 void
+send_key(Display *xdpy, int keycode, int shift)
+{
+	int shift_kc = XKeysymToKeycode(xdpy, XK_Shift_L);
+
+	if (shift == 1)
+		XTestFakeKeyEvent(xdpy, shift_kc, True, CurrentTime);
+	XTestFakeKeyEvent(xdpy, keycode, True, CurrentTime);
+	XTestFakeKeyEvent(xdpy, keycode, False, CurrentTime);
+	if (shift == 1)
+		XTestFakeKeyEvent(xdpy, shift_kc, False, CurrentTime);
+}
+
+void
+xtype(json_t *obj)
+{
+	json_t      *v;
+	const char **f;
+	const char  *secret;
+	char         c;
+
+	Display     *xdpy;
+	const char  *d = getenv("DISPLAY");
+	int          min_kc, max_kc, ks_per_kc;
+	int          k, kc_i, ks_i;
+	int          kc_f11, kc_esc;
+	KeySym      *keysyms;
+	char        *ks_str;
+	XEvent       ev;
+	Window       root_w;
+
+	if (obj == NULL) {
+		printf("secret not found\n");
+		return;
+	}
+
+	for (f = fields; *f; f++) {
+		if (strcmp(*f, "secret") == 0)
+			continue;
+		if ((v = json_object_get(obj, *f)))
+			printf("%s: %s\n", *f, json_string_value(v));
+	}
+
+	v = json_object_get(obj, "secret");
+	if (v == NULL) {
+		warnx("could not get secret");
+		return;
+	}
+
+	if ((secret = json_string_value(v)) == NULL) {
+		warnx("invalid JSON string for secret");
+		return;
+	}
+
+	if ((xdpy = XOpenDisplay(d)) == NULL)
+		err(1, "can't open display: %s\n", d);
+
+	kc_f11 = XKeysymToKeycode(xdpy, XK_F11);
+	kc_esc = XKeysymToKeycode(xdpy, XK_Escape);
+	root_w = DefaultRootWindow(xdpy);
+
+	XGrabKey(xdpy, kc_f11, 0, root_w, False, GrabModeAsync, GrabModeAsync);
+	XGrabKey(xdpy, kc_esc, 0, root_w, False, GrabModeAsync, GrabModeAsync);
+	XSelectInput(xdpy, root_w, KeyPressMask|KeyReleaseMask);
+
+	for (;;) {
+		XNextEvent(xdpy, &ev);
+		if (ev.type == KeyPress) {
+			XUngrabKey(xdpy, kc_f11, 0, root_w);
+			XUngrabKey(xdpy, kc_esc, 0, root_w);
+			if (XLookupKeysym(&ev.xkey, 0) == XK_Escape) {
+				XCloseDisplay(xdpy);
+				return;
+			}
+		}
+		if (ev.type == KeyRelease)
+			break;
+	}
+	XSelectInput(xdpy, root_w, 0);
+	XSync(xdpy, False);
+
+	XDisplayKeycodes(xdpy, &min_kc, &max_kc);
+	keysyms = XGetKeyboardMapping(xdpy, min_kc, max_kc - min_kc + 1,
+	    &ks_per_kc);
+
+	while ((c = *secret++)) {
+		for (kc_i = min_kc; kc_i < max_kc; kc_i++) {
+			for (ks_i = 0; ks_i < ks_per_kc; ks_i++) {
+				k = (kc_i - min_kc) * ks_per_kc + ks_i;
+				ks_str = XKeysymToString(keysyms[k]);
+				if (ks_str && keysyms[k] == c) {
+					send_key(xdpy, kc_i, ks_i);
+					XSync(xdpy, False);
+					usleep(20000);
+					break;
+				}
+			}
+		}
+	}
+
+	XFree(keysyms);
+	XCloseDisplay(xdpy);
+}
+
+void
 paste(json_t *obj)
 {
 	json_t      *v;
@@ -637,10 +769,6 @@ paste(json_t *obj)
 	size_t       w;
 	char        *iobuf;
 	int          status;
-
-	// TODO: we should have an internal version where we
-	// set the X selections ourselves, to avoid having to pipe
-	// secrets to an external program.
 
 	if (obj == NULL) {
 		printf("secret not found\n");
@@ -1143,11 +1271,18 @@ main(int argc, char **argv)
 				save_db();
 			clear_db();
 		} else if (strcmp(token, "help") == 0) {
-			printf("Help: add, change, delete, help, list, paste, quit, show, showall\n");
+			printf("Help: add, change, delete, help, list, paste, quit, show, showall, xtype\n");
 		} else if (strcmp(token, "list") == 0) {
 			token = strtok(NULL, " ");
 			load_db();
 			list_secrets(token);
+			clear_db();
+		} else if (strcmp(token, "xtype") == 0) {
+			token = strtok(NULL, " ");
+			if (token == NULL)
+				goto again;
+			load_db();
+			xtype(find_secret(token));
 			clear_db();
 		} else if (strcmp(token, "paste") == 0) {
 			token = strtok(NULL, " ");
