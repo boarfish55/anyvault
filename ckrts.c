@@ -683,8 +683,10 @@ xtype(json_t *obj)
 	kc_esc = XKeysymToKeycode(xdpy, XK_Escape);
 	root_w = DefaultRootWindow(xdpy);
 
-	XGrabKey(xdpy, kc_f11, 0, root_w, False, GrabModeAsync, GrabModeAsync);
-	XGrabKey(xdpy, kc_esc, 0, root_w, False, GrabModeAsync, GrabModeAsync);
+	XGrabKey(xdpy, kc_f11, AnyModifier, root_w, False,
+	    GrabModeAsync, GrabModeAsync);
+	XGrabKey(xdpy, kc_esc, AnyModifier, root_w, False,
+	    GrabModeAsync, GrabModeAsync);
 	XSelectInput(xdpy, root_w, KeyPressMask|KeyReleaseMask);
 
 	for (;;) {
