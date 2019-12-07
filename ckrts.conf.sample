@@ -32,6 +32,18 @@ decrypt_cmd: /usr/bin/gpg --decrypt %db 2> /dev/null
 # secret from STDIN. Ideally, it should not keep the secret forever.
 paste_cmd: /usr/bin/xclip -quiet
 
+# When using the 'xtype' command to have X simulate keystrokes for typing
+# the password, use this hotkey to signal ckrts to begin typing.
+# The key names can be found in /usr/include/X11/keysymdef.h, or
+# https://cgit.freedesktop.org/xorg/proto/x11proto/tree/keysymdef.h,
+# without the "XK_" prefix.
+xtype_hotkey: F11
+
+# When using the 'xtype' command to have X simulate keystrokes for typing
+# the password, use this hotkey to abort typing and return to the command
+# prompt.
+xtype_esc: Escape
+
 # If set to 'no', the program will not use mlock() to ensure allocated
 # memory always remains in RAM. This is insecure if the system isn't
 # encrypting its swap memory.
