@@ -55,6 +55,8 @@ int     debug_level = 0;
 char   *encrypt_cmd = NULL;
 char   *decrypt_cmd = NULL;
 char   *paste_cmd = NULL;
+char   *xtype_hotkey = "F11";
+char   *xtype_esc = "Escape";
 
 int         db_backup_done = 0;
 json_t     *db = NULL;
@@ -281,6 +283,10 @@ read_cfg()
 			paste_cmd = strdup(v);
 			if (paste_cmd == NULL)
 				err(1, "could not load paste command");
+		} else if (strcmp(p, "xtype_hotkey") == 0) {
+			xtype_hotkey = strdup(v);
+		} else if (strcmp(p, "xtype_esc") == 0) {
+			xtype_esc = strdup(v);
 		} else if (strcmp(p, "db_path") == 0) {
 			if (snprintf(db_path, sizeof(db_path), "%s", v)
 			    >= sizeof(db_path))
@@ -644,7 +650,7 @@ xtype(json_t *obj)
 	const char  *d = getenv("DISPLAY");
 	int          min_kc, max_kc, ks_per_kc;
 	int          k, kc_i, ks_i;
-	int          kc_f11, kc_esc;
+	int          kc_hot, kc_esc, ign_mod;
 	KeySym      *keysyms;
 	char        *ks_str;
 	XEvent       ev;
@@ -653,13 +659,6 @@ xtype(json_t *obj)
 	if (obj == NULL) {
 		printf("secret not found\n");
 		return;
-	}
-
-	for (f = fields; *f; f++) {
-		if (strcmp(*f, "secret") == 0)
-			continue;
-		if ((v = json_object_get(obj, *f)))
-			printf("%s: %s\n", *f, json_string_value(v));
 	}
 
 	v = json_object_get(obj, "secret");
@@ -673,27 +672,53 @@ xtype(json_t *obj)
 		return;
 	}
 
-	printf("-- Press F11 to send keys, or ESC to abort        --\n");
-	printf("-- NOTE: This might not work well with non-ASCII. --\n");
-
 	if ((xdpy = XOpenDisplay(d)) == NULL)
 		err(1, "can't open display: %s\n", d);
 
-	kc_f11 = XKeysymToKeycode(xdpy, XK_F11);
-	kc_esc = XKeysymToKeycode(xdpy, XK_Escape);
-	root_w = DefaultRootWindow(xdpy);
+	if (XStringToKeysym(xtype_hotkey) == 0) {
+		warnx("invalid xtype_hotkey");
+		return;
+	}
+	if (XStringToKeysym(xtype_esc) == 0) {
+		warnx("invalid xtype_esc");
+		return;
+	}
 
-	XGrabKey(xdpy, kc_f11, AnyModifier, root_w, False,
+	for (f = fields; *f; f++) {
+		if (strcmp(*f, "secret") == 0)
+			continue;
+		if ((v = json_object_get(obj, *f)))
+			printf("%s: %s\n", *f, json_string_value(v));
+	}
+
+	printf("** Press %s to send keys, or %s to abort\n",
+	    xtype_hotkey, xtype_esc);
+	printf("** NOTE: This might not work well with non-ASCII characters.\n");
+
+	kc_hot = XKeysymToKeycode(xdpy, XStringToKeysym(xtype_hotkey));
+	kc_esc = XKeysymToKeycode(xdpy, XStringToKeysym(xtype_esc));
+	root_w = DefaultRootWindow(xdpy);
+	ign_mod = Mod2Mask;
+
+	XGrabKey(xdpy, kc_hot, 0, root_w, False,
 	    GrabModeAsync, GrabModeAsync);
-	XGrabKey(xdpy, kc_esc, AnyModifier, root_w, False,
+	XGrabKey(xdpy, kc_esc, 0, root_w, False,
 	    GrabModeAsync, GrabModeAsync);
+
+	XGrabKey(xdpy, kc_hot, ign_mod, root_w, False,
+	    GrabModeAsync, GrabModeAsync);
+	XGrabKey(xdpy, kc_esc, ign_mod, root_w, False,
+	    GrabModeAsync, GrabModeAsync);
+
 	XSelectInput(xdpy, root_w, KeyPressMask|KeyReleaseMask);
 
 	for (;;) {
 		XNextEvent(xdpy, &ev);
 		if (ev.type == KeyPress) {
-			XUngrabKey(xdpy, kc_f11, 0, root_w);
+			XUngrabKey(xdpy, kc_hot, 0, root_w);
 			XUngrabKey(xdpy, kc_esc, 0, root_w);
+			XUngrabKey(xdpy, kc_hot, ign_mod, root_w);
+			XUngrabKey(xdpy, kc_esc, ign_mod, root_w);
 			if (XLookupKeysym(&ev.xkey, 0) == XK_Escape) {
 				XCloseDisplay(xdpy);
 				return;
@@ -711,7 +736,11 @@ xtype(json_t *obj)
 
 	while ((c = *secret++)) {
 		for (kc_i = min_kc; kc_i < max_kc; kc_i++) {
-			for (ks_i = 0; ks_i < ks_per_kc; ks_i++) {
+			/*
+			 * FIXME: ks_i < 2, because we only want to loop over
+			 * characters from the 2 first groups for now.
+			 */
+			for (ks_i = 0; ks_i < 2; ks_i++) {
 				k = (kc_i - min_kc) * ks_per_kc + ks_i;
 				ks_str = XKeysymToString(keysyms[k]);
 				if (ks_str && keysyms[k] == c) {
