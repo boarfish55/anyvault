@@ -7,17 +7,15 @@ There are three ways to retrieve stored passwords:
 2) The 'paste' command:
    Sends to a program (such as xclip) via a pipe over STDIN
 3) The 'xtype' command:
-   Emulates user keystrokes using X11's XTEST extension.
-
-Note that to use the 'xtype' command, the following X11 extensions are
-required: XTEST, and XKEYBOARD. You can verify if you have them using
-'xdpyinfo', from X11 utils.
+   Emulates user keystrokes using X11's XTEST extension. Will not work
+   if you don't have XTEST. This can be seen with the 'xdpyinfo' utility.
 
 Library dependencies (and corresponding license):
 - libjansson-dev >= 2.9 (Expat)
 - libreadline-dev (GPL-3)
 - pkg-config
 - Ruby ronn (Expat)
+- X11, xtst (MIT)
 
 To build:
 $ make

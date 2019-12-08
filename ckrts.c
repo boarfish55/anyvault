@@ -35,9 +35,12 @@
 #include <readline/history.h>
 #include <jansson.h>
 
+#include <wchar.h>
+#include <wctype.h>
+#include <locale.h>
+
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
-#include <X11/XKBlib.h>
 #include <X11/extensions/XTest.h>
 
 const char  program_name[] = PROGNAME;
@@ -644,15 +647,15 @@ xtype(json_t *obj)
 	json_t      *v;
 	const char **f;
 	const char  *secret;
-	char         c;
+	wchar_t     *wcs = NULL, *wp;
+	size_t       wcs_l;
 
 	Display     *xdpy;
 	const char  *d = getenv("DISPLAY");
 	int          min_kc, max_kc, ks_per_kc;
-	int          k, kc_i, ks_i;
+	int          k, kc_i, ks_i, kc_empty, kc_scratch;
 	int          kc_hot, kc_esc, ign_mod;
-	KeySym      *keysyms;
-	char        *ks_str;
+	KeySym      *keysyms, *ks = NULL;
 	XEvent       ev;
 	Window       root_w;
 
@@ -672,16 +675,18 @@ xtype(json_t *obj)
 		return;
 	}
 
-	if ((xdpy = XOpenDisplay(d)) == NULL)
-		err(1, "can't open display: %s\n", d);
+	if ((xdpy = XOpenDisplay(d)) == NULL) {
+		warnx("can't open display: %s\n", d);
+		return;
+	}
 
 	if (XStringToKeysym(xtype_hotkey) == 0) {
 		warnx("invalid xtype_hotkey");
-		return;
+		goto exit_display;
 	}
 	if (XStringToKeysym(xtype_esc) == 0) {
 		warnx("invalid xtype_esc");
-		return;
+		goto exit_display;
 	}
 
 	for (f = fields; *f; f++) {
@@ -691,9 +696,30 @@ xtype(json_t *obj)
 			printf("%s: %s\n", *f, json_string_value(v));
 	}
 
+	if (setlocale(LC_CTYPE, "") == NULL) {
+		warn("setlocale");
+		goto exit_display;
+	}
+
+	if ((wcs_l = mbstowcs(NULL, secret, 0)) == (size_t) -1) {
+		warn("mbstowcs");
+		goto exit_display;
+	}
+
+	wcs = calloc(wcs_l + 1, sizeof(wchar_t));
+	if (wcs == NULL) {
+		warn("calloc");
+		goto exit_display;
+	}
+	if (mbstowcs(wcs, secret, wcs_l + 1) == (size_t) -1) {
+		warn("mbstowcs");
+		goto exit_display;
+	}
+
 	printf("** Press %s to send keys, or %s to abort\n",
 	    xtype_hotkey, xtype_esc);
-	printf("** NOTE: This might not work well with non-ASCII characters.\n");
+	printf("** NOTE: this has not been well tested with non-ASCII "
+	    "characters.\n");
 
 	kc_hot = XKeysymToKeycode(xdpy, XStringToKeysym(xtype_hotkey));
 	kc_esc = XKeysymToKeycode(xdpy, XStringToKeysym(xtype_esc));
@@ -719,10 +745,8 @@ xtype(json_t *obj)
 			XUngrabKey(xdpy, kc_esc, 0, root_w);
 			XUngrabKey(xdpy, kc_hot, ign_mod, root_w);
 			XUngrabKey(xdpy, kc_esc, ign_mod, root_w);
-			if (XLookupKeysym(&ev.xkey, 0) == XK_Escape) {
-				XCloseDisplay(xdpy);
-				return;
-			}
+			if (XLookupKeysym(&ev.xkey, 0) == XK_Escape)
+				goto exit_wcs;
 		}
 		if (ev.type == KeyRelease)
 			break;
@@ -734,26 +758,52 @@ xtype(json_t *obj)
 	keysyms = XGetKeyboardMapping(xdpy, min_kc, max_kc - min_kc + 1,
 	    &ks_per_kc);
 
-	while ((c = *secret++)) {
-		for (kc_i = min_kc; kc_i < max_kc; kc_i++) {
-			/*
-			 * FIXME: ks_i < 2, because we only want to loop over
-			 * characters from the 2 first groups for now.
-			 */
-			for (ks_i = 0; ks_i < 2; ks_i++) {
-				k = (kc_i - min_kc) * ks_per_kc + ks_i;
-				ks_str = XKeysymToString(keysyms[k]);
-				if (ks_str && keysyms[k] == c) {
-					send_key(xdpy, kc_i, ks_i);
-					XSync(xdpy, False);
-					usleep(20000);
-					break;
-				}
+	/* Find unused keycode to use as scratch space */
+	for (kc_i = min_kc; kc_i < max_kc; kc_i++) {
+		kc_empty = 1;
+		for (ks_i = 0; ks_i < ks_per_kc; ks_i++) {
+			k = (kc_i - min_kc) * ks_per_kc + ks_i;
+			if (keysyms[k] != 0) {
+				kc_empty = 0;
+				break;
 			}
 		}
+		if (kc_empty)
+			break;
+	}
+	XFree(keysyms);
+	if (kc_i == max_kc) {
+		warnx("no empty keycode; cannot xtype");
+		goto exit_wcs;
+	}
+	kc_scratch = kc_i;
+
+	ks = malloc(sizeof(KeySym) * ks_per_kc);
+	if (ks == NULL) {
+		warn("malloc");
+		goto exit_wcs;
 	}
 
-	XFree(keysyms);
+	for (wp = wcs; *wp != 0; wp++) {
+		if (!iswprint(*wp) || !XKeysymToString(*wp))
+			continue;
+
+		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
+			ks[ks_i] = *wp;
+		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
+		XSync(xdpy, False);
+		send_key(xdpy, kc_scratch, 0);
+		XSync(xdpy, False);
+		usleep(20000);
+		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
+			ks[ks_i] = 0;
+		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
+		XSync(xdpy, False);
+	}
+	free(ks);
+exit_wcs:
+	free(wcs);
+exit_display:
 	XCloseDisplay(xdpy);
 }
 

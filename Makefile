@@ -14,7 +14,7 @@ $(PROGNAME): $(PROGNAME).c
 		-DVERSION=\"$(VERSION)\" \
 		-D_GNU_SOURCE \
 		$(PROGNAME).c -g -o $(PROGNAME) \
-		`pkg-config --libs 'jansson >= 2.9' x11 xkbcommon xtst` \
+		`pkg-config --libs 'jansson >= 2.9' x11 xtst` \
 		-lreadline \
 		-Wall
 
@@ -25,8 +25,7 @@ $(PROGNAME)-static: $(PROGNAME).c
 		$(PROGNAME).c -g \
 		-o $(PROGNAME)-static \
 		-lreadline -lncurses -ltinfo -pthread \
-		`pkg-config --static --libs 'jansson >= 2.9' \
-		x11 xkbcommon xtst` \
+		`pkg-config --static --libs 'jansson >= 2.9' x11 xtst` \
 		-Wall
 
 $(PROGNAME).1: $(PROGNAME).1.ronn
