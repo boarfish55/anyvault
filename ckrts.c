@@ -706,9 +706,9 @@ xtype(json_t *obj)
 		goto exit_display;
 	}
 
-	wcs = calloc(wcs_l + 1, sizeof(wchar_t));
+	wcs = locked_mem((wcs_l + 1) * sizeof(wchar_t));
 	if (wcs == NULL) {
-		warn("calloc");
+		warn("locked_mem");
 		goto exit_display;
 	}
 	if (mbstowcs(wcs, secret, wcs_l + 1) == (size_t) -1) {
@@ -778,7 +778,7 @@ xtype(json_t *obj)
 	}
 	kc_scratch = kc_i;
 
-	ks = malloc(sizeof(KeySym) * ks_per_kc);
+	ks = locked_mem(sizeof(KeySym) * ks_per_kc);
 	if (ks == NULL) {
 		warn("malloc");
 		goto exit_wcs;
@@ -800,9 +800,9 @@ xtype(json_t *obj)
 		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
 		XSync(xdpy, False);
 	}
-	free(ks);
+	wipe_mem(ks);
 exit_wcs:
-	free(wcs);
+	wipe_mem(wcs);
 exit_display:
 	XCloseDisplay(xdpy);
 }
