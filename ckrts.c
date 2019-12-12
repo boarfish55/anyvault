@@ -624,19 +624,6 @@ show_secret(json_t *obj, int hide_secret)
 	}
 }
 
-void
-send_key(Display *xdpy, int keycode, int shift)
-{
-	int shift_kc = XKeysymToKeycode(xdpy, XK_Shift_L);
-
-	if (shift == 1)
-		XTestFakeKeyEvent(xdpy, shift_kc, True, CurrentTime);
-	XTestFakeKeyEvent(xdpy, keycode, True, CurrentTime);
-	XTestFakeKeyEvent(xdpy, keycode, False, CurrentTime);
-	if (shift == 1)
-		XTestFakeKeyEvent(xdpy, shift_kc, False, CurrentTime);
-}
-
 /*
  * TODO: Need a bit of info on the following.
  * TODO: Definitely need some more error handling.
@@ -791,14 +778,16 @@ xtype(json_t *obj)
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
 			ks[ks_i] = *wp;
 		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
-		XSync(xdpy, False);
-		send_key(xdpy, kc_scratch, 0);
+		XTestFakeKeyEvent(xdpy, kc_scratch, True, CurrentTime);
 		XSync(xdpy, False);
 		usleep(20000);
+
+		XTestFakeKeyEvent(xdpy, kc_scratch, False, CurrentTime);
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
 			ks[ks_i] = 0;
 		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
 		XSync(xdpy, False);
+		usleep(20000);
 	}
 	wipe_mem(ks);
 exit_wcs:
