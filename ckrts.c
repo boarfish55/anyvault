@@ -147,8 +147,8 @@ wipe_mem(void *buf)
 			if (errno == EAGAIN)
 				continue;
 			warn("cannot wipe buffer at address %p; read", buf);
-			/* memset() as a fallback */
-			memset(buf, 0, len);
+			/* fallback to zeroes */
+			explicit_bzero(buf, len);
 			goto end;
 		}
 	}
