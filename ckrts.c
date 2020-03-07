@@ -406,9 +406,10 @@ load_db()
 void
 clear_db()
 {
-	if (db != NULL && json_object_clear(db) == -1)
+	if (db != NULL && json_object_clear(db) == -1) {
 		warnx("failed to clear in-memory JSON database");
-	db = NULL;
+		db = NULL;
+	}
 }
 
 void
