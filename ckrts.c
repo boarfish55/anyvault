@@ -1,7 +1,7 @@
 /*
  *  ckrts -- a command-line password manager.
  *
- *  Copyright (C) 2019 Pascal Lalonde
+ *  Copyright (C) 2019-2020 Pascal Lalonde <plalonde@overnet.ca>
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -1306,7 +1306,8 @@ main(int argc, char **argv)
 				save_db();
 			clear_db();
 		} else if (strcmp(token, "help") == 0) {
-			printf("Help: add, change, delete, help, list, paste, quit, show, showall, xtype\n");
+			printf("Help: add, change, delete, help, list, paste, "
+			    "rename, quit, show, showall, xtype\n");
 		} else if (strcmp(token, "list") == 0) {
 			token = strtok(NULL, " ");
 			load_db();
