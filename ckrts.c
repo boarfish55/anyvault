@@ -785,6 +785,9 @@ xtype(json_t *obj)
 		usleep(20000);
 
 		XTestFakeKeyEvent(xdpy, kc_scratch, False, CurrentTime);
+		XSync(xdpy, False);
+		usleep(20000);
+
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
 			ks[ks_i] = 0;
 		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
