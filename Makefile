@@ -1,5 +1,5 @@
 PROGNAME=ckrts
-VERSION=1.4.2
+VERSION=1.4.4
 DESTDIR=
 prefix=~
 
