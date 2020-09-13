@@ -966,7 +966,7 @@ add_secret(const char *key, int overwrite)
 	s = json_object();
 	if (overwrite) {
 		old = json_object_get(get_secrets(), key);
-		if (s == NULL) {
+		if (old == NULL) {
 			warnx("couldn't get secret %s\n", key);
 			return 0;
 		}
