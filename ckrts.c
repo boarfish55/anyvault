@@ -1,7 +1,7 @@
 /*
  *  ckrts -- a command-line password manager.
  *
- *  Copyright (C) 2019-2020 Pascal Lalonde <plalonde@overnet.ca>
+ *  Copyright (C) 2019-2021 Pascal Lalonde <plalonde@overnet.ca>
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -39,6 +39,7 @@
 #include <wctype.h>
 #include <locale.h>
 
+#include <X11/XKBlib.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
@@ -647,6 +648,8 @@ xtype(json_t *obj)
 	KeySym      *keysyms, *ks = NULL;
 	XEvent       ev;
 	Window       root_w;
+	XkbStateRec  kbstate;
+	int          saved_kbgroup;
 
 	if (obj == NULL) {
 		printf("secret not found\n");
@@ -780,11 +783,23 @@ xtype(json_t *obj)
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
 			ks[ks_i] = *wp;
 		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
+		XSync(xdpy, False);
+
+		/* Press ... */
+		XkbGetState(xdpy, XkbUseCoreKbd, &kbstate);
+		saved_kbgroup = kbstate.group;
+		XkbLockGroup(xdpy, XkbUseCoreKbd, 0);
 		XTestFakeKeyEvent(xdpy, kc_scratch, True, CurrentTime);
+		XkbLockGroup(xdpy, XkbUseCoreKbd, saved_kbgroup);
 		XSync(xdpy, False);
 		usleep(20000);
 
+		/* Release. */
+		XkbGetState(xdpy, XkbUseCoreKbd, &kbstate);
+		saved_kbgroup = kbstate.group;
+		XkbLockGroup(xdpy, XkbUseCoreKbd, 0);
 		XTestFakeKeyEvent(xdpy, kc_scratch, False, CurrentTime);
+		XkbLockGroup(xdpy, XkbUseCoreKbd, saved_kbgroup);
 		XSync(xdpy, False);
 		usleep(20000);
 
@@ -792,7 +807,6 @@ xtype(json_t *obj)
 			ks[ks_i] = 0;
 		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
 		XSync(xdpy, False);
-		usleep(20000);
 	}
 	wipe_mem(ks);
 exit_wcs:
@@ -934,6 +948,11 @@ read_field(const char *name, int echo)
 		return NULL;
 	}
 
+	// TODO: eventually get rid of this by looping until we get to
+	// a newline, then using a fixed buffer size like 4096, then realloc()
+	// until we can fit it all. We'd still need a max_value_len, but it
+	// could be much larger. And it paves the way to arbitrary secrets
+	// like keys in base64.
 	if (fgets(input, max_value_length + 1, stdin) == NULL) {
 		warn("fgets");
 		return NULL;
