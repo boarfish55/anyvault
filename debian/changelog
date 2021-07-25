@@ -1,3 +1,14 @@
+ckrts (1.4.6) unstable; urgency=medium
+
+  * Version 1.4.6
+  * Handled the XkbLockGroup, which seems to appease Firefox
+  * Removed spurious XFlush
+  * TODOs
+  * Copyright +2021
+  * Debianize for gbp
+
+ -- Pascal Lalonde <plalonde@overnet.ca>  Sat, 24 Jul 2021 22:55:51 -0400
+
 ckrts (1.4.5) unstable; urgency=medium
 
   * Fix a bug when doing 'change' on a nonexistent secret
