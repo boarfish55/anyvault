@@ -1,0 +1,40 @@
+ckrts (1.4.5) unstable; urgency=medium
+
+  * Fix a bug when doing 'change' on a nonexistent secret
+
+ -- Pascal Lalonde <plalonde@overnet.ca>  Sun, 13 Sep 2020 15:47:24 -0400
+
+ckrts (1.4.4) unstable; urgency=medium
+
+  * Add an XSync + delay as an attempt to make Chrome happy
+
+ -- Pascal Lalonde <plalonde@overnet.ca>  Sun, 13 Sep 2020 15:45:29 -0400
+
+ckrts (1.4.3) unstable; urgency=medium
+
+  * Bugfixes
+
+ckrts (1.4.2) unstable; urgency=medium
+
+  * Add missing help entry
+
+ckrts (1.4.1) unstable; urgency=medium
+
+  * Make sure xtype uses locked_mem
+  * Some code cleanup
+
+ -- Pascal Lalonde <plalonde@overnet.ca>  Sun, 08 Dec 2019 00:02:40 -0500
+
+ckrts (1.4) unstable; urgency=medium
+
+  * New 'xtype' command to "type" secrets using XTest instead of using
+    the clipboard, which is less secure.
+  * ckrts is now GPL-3
+
+ -- Pascal Lalonde <plalonde@overnet.ca>  Sun, 08 Dec 2019 00:02:40 -0500
+
+ckrts (1.2.1) unstable; urgency=medium
+
+  * Initial Release.
+
+ -- Pascal Lalonde <plalonde@overnet.ca>  Sat, 03 Nov 2018 12:42:16 -0400
