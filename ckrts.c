@@ -1,7 +1,7 @@
 /*
  *  ckrts -- a command-line password manager.
  *
- *  Copyright (C) 2019-2021 Pascal Lalonde <plalonde@overnet.ca>
+ *  Copyright (C) 2019-2023 Pascal Lalonde <plalonde@overnet.ca>
  *
  *  This program is free software: you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License as published by
@@ -407,8 +407,8 @@ load_db()
 void
 clear_db()
 {
-	if (db != NULL && json_object_clear(db) == -1) {
-		warnx("failed to clear in-memory JSON database");
+	if (db != NULL) {
+		json_decref(db);
 		db = NULL;
 	}
 }
@@ -425,7 +425,7 @@ save_db()
 
 	if (encrypt_cmd == NULL) {
 		warnx("no encryption command defined; "
-		    "you cannot be able to save");
+		    "you will not be able to save");
 		return;
 	}
 
@@ -453,7 +453,7 @@ save_db()
 
 	cmd = str_replace(encrypt_cmd, "%db", tmp_db_path);
 	if (cmd == NULL) {
-		warn("encryption command could not be computed");
+		warn("encryption command could not be assembled");
 		unlink(tmp_db_path);
 		return;
 	}
@@ -503,9 +503,10 @@ save_db()
 	free(cmd);
 
 	/* We only do this once per run, even if we save multiple times */
+	// TODO: use a backup_cmd instead of just doing a copy.
 	if (!db_backup_done) {
 		if (debug_level)
-			warnx("backuping up before saving: %s", bk_db_path);
+			warnx("backing up before saving: %s", bk_db_path);
 		if (rename(db_path, bk_db_path) == -1)
 			warn("could not rename %s to %s", db_path, bk_db_path);
 		db_backup_done = 1;
@@ -550,7 +551,7 @@ get_secret_names(const char *pattern)
 
 	n_keys_max = json_object_size(get_secrets()) * 2;
 
-	// Add an extra sizeof(char*) to make room for the last NULL
+	/* Add an extra sizeof(char*) to make room for the last NULL */
 	keys = locked_mem(n_keys_max * sizeof(char *) + sizeof(char *));
 	if (keys == NULL)
 		return NULL;
@@ -628,8 +629,11 @@ show_secret(json_t *obj, int hide_secret)
 }
 
 /*
- * TODO: Need a bit of info on the following.
- * TODO: Definitely need some more error handling.
+ * TODO: This is a bit flaky, sometimes one of the letters repeats, as
+ *       if there is a race of some sort. For example, if a password is
+ *       "Password", sometimes the result in the text box ends up being
+ *       "PPssword". This never happens in a terminal, always in a browser
+ *       window so far.
  */
 void
 xtype(json_t *obj)
@@ -1331,7 +1335,7 @@ main(int argc, char **argv)
 			clear_db();
 		} else if (strcmp(token, "help") == 0) {
 			printf("Help: add, change, delete, help, list, paste, "
-			    "rename, quit, show, showall, xtype\n");
+			    "rename, save, quit, show, showall, xtype\n");
 		} else if (strcmp(token, "list") == 0) {
 			token = strtok(NULL, " ");
 			load_db();
@@ -1360,6 +1364,10 @@ main(int argc, char **argv)
 			load_db();
 			if (rename_secret(token))
 				save_db();
+			clear_db();
+		} else if (strcmp(token, "save") == 0) {
+			load_db();
+			save_db();
 			clear_db();
 		} else if (strcmp(token, "quit") == 0) {
 			quit = 1;
