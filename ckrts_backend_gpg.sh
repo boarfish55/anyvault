@@ -46,7 +46,7 @@ fi
 # directly into the encryption command which handles the decrypted data
 # carefully without passing it through multiple buffer which may or may
 # not keep the decrypted data around for a long time.
-# 
+#
 # Be mindful of the path of each command.
 encrypt() {
 	umask 077
