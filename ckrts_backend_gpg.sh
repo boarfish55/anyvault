@@ -49,7 +49,7 @@ fi
 #
 # Be mindful of the path of each command.
 encrypt() {
-	umask 077
+	umask 0077
 
 	tmpdb=`mktemp -t ckrts.XXXXXX`
 	[ $? -ne 0 ] && exit 1

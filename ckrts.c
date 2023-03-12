@@ -50,7 +50,7 @@
 const char  program_name[] = PROGNAME;
 const char *version = VERSION;
 
-char    cfg_path[PATH_MAX + 1];
+char    cfg_path[PATH_MAX] = "";
 int     timeout = 300;
 size_t  max_value_length = 2048;
 int     no_mlock = 0;
@@ -337,7 +337,7 @@ safe_popen(char *const program[], const char *type, pid_t *pid)
 		if (type[1] == 'e' &&
 		    fcntl(p_io[0], F_SETFD, FD_CLOEXEC) == -1) {
 			warn("fcntl");
-			close(p_io[0]);
+			fclose(f);
 			return NULL;
 		}
 	} else if (type[0] == 'w') {
@@ -351,7 +351,7 @@ safe_popen(char *const program[], const char *type, pid_t *pid)
 		if (type[1] == 'e' &&
 		    fcntl(p_io[1], F_SETFD, FD_CLOEXEC) == -1) {
 			warn("fcntl");
-			close(p_io[1]);
+			fclose(f);
 			return NULL;
 		}
 	} else {
@@ -371,8 +371,11 @@ str_replace(const char *str, const char *search, const char *replace)
 	char       *result, *saved;
 	size_t      search_len;
 
+	if (search == NULL)
+		return strdup(str);
+
 	pos = strstr(str, search);
-	if (pos == NULL || search == NULL)
+	if (pos == NULL)
 		return strdup(str);
 
 	search_len = strlen(search);
@@ -594,30 +597,31 @@ save_db()
 	if (debug_level)
 		warnx("saving: %s", encrypt_cmd);
 
+	iobuf = locked_mem(BUFSIZ);
+	if (iobuf == NULL) {
+		warn("save_db");
+		return;
+	}
+
 	if ((cmd_parts = str_split(encrypt_cmd)) == NULL)
 		errx(1, "str_split");
 	cmd_fd = safe_popen((char *const *)cmd_parts, "w", &child);
 	if (cmd_fd == NULL) {
 		warn("cannot encrypt");
 		free(cmd_parts);
+		wipe_mem(iobuf);
 		return;
 	}
 	free(cmd_parts);
 
-	iobuf = locked_mem(BUFSIZ);
-	if (iobuf == NULL) {
-		warnx("save_db");
-		free(cmd_parts);
-		return;
-	}
 	setbuf(cmd_fd, iobuf);
 
 	if (json_dumpf(db, cmd_fd, JSON_INDENT(2) | JSON_SORT_KEYS) == -1) {
 		warnx("could not prepare JSON output while saving");
 		encode_failed = 1;
 	}
-again:
 	fclose(cmd_fd);
+again:
 	if (waitpid(child, &status, 0) == -1) {
 		if (errno == EINTR) {
 			warn("waitpid");
@@ -847,7 +851,7 @@ xtype(json_t *obj)
 	}
 	if (mbstowcs(wcs, secret, wcs_l + 1) == (size_t) -1) {
 		warn("mbstowcs");
-		goto exit_display;
+		goto exit_wcs;
 	}
 
 	printf("** Press %s to send keys, or %s to abort\n",
@@ -967,6 +971,8 @@ paste(json_t *obj)
 	size_t       w;
 	char        *iobuf;
 	int          status;
+	char       **cmd_parts;
+	pid_t        child;
 
 	if (obj == NULL) {
 		printf("secret not found\n");
@@ -985,23 +991,30 @@ paste(json_t *obj)
 			printf("%s: %s\n", *f, json_string_value(v));
 	}
 
-	cmd_fd = popen(paste_cmd, "w");
-	if (cmd_fd == NULL) {
-		warn("cannot paste; popen");
-		return;
-	}
-
 	iobuf = locked_mem(BUFSIZ);
 	if (iobuf == NULL) {
 		warnx("paste");
 		return;
 	}
+
+	if ((cmd_parts = str_split(paste_cmd)) == NULL)
+		errx(1, "str_split");
+	cmd_fd = safe_popen((char *const *)cmd_parts, "w", &child);
+	if (cmd_fd == NULL) {
+		warn("cannot paste");
+		free(cmd_parts);
+		wipe_mem(iobuf);
+		return;
+	}
+	free(cmd_parts);
+
 	setbuf(cmd_fd, iobuf);
 
 	v = json_object_get(obj, "secret");
 	if (v == NULL) {
 		warnx("could not get secret");
-		pclose(cmd_fd);
+		fclose(cmd_fd);
+		free(cmd_parts);
 		wipe_mem(iobuf);
 		return;
 	}
@@ -1014,26 +1027,27 @@ paste(json_t *obj)
 			    "write count: %lu", w);
 	}
 
-	status = pclose(cmd_fd);
+	fclose(cmd_fd);
+again:
+	if (waitpid(child, &status, 0) == -1) {
+		if (errno == EINTR) {
+			warn("waitpid");
+			goto again;
+		}
+		err(1, "waitpid");
+	}
+
 	wipe_mem(iobuf);
-	switch (status) {
-	case -1:
-		warn("paste command failed");
-		break;
-	case 130:
-		warnx("paste command ended");
-		break;
-	case 0:
-		break;
-	default:
-		warnx("paste command failed with status %d", status);
+	if (status != 0) {
+		warnx("paste command failed with code %d: '%s'",
+		    status, paste_cmd);
 	}
 }
 
 int
 confirm(const char *prompt, int dflt)
 {
-	char c;
+	int c;
 
 	printf("%s ", prompt);
 	fflush(stdout);
@@ -1097,12 +1111,14 @@ read_field(const char *name, int echo)
 	// like keys in base64.
 	if (fgets(input, max_value_length + 1, stdin) == NULL) {
 		warn("fgets");
+		wipe_mem(input);
 		return NULL;
 	}
 
 	if (!echo) {
 		if (tcsetattr(0, TCSANOW, &saved_ts) == -1) {
 			warn("cannot reset terminal settings");
+			wipe_mem(input);
 			return NULL;
 		}
 		printf("\n");
@@ -1158,6 +1174,7 @@ add_secret(const char *key, int overwrite)
 					wipe_mem(input2);
 					break;
 				}
+				wipe_mem(input);
 				wipe_mem(input2);
 				printf("secrets don't match; try again\n");
 			}
@@ -1356,10 +1373,6 @@ main(int argc, char **argv)
 
 	snprintf(prompt, sizeof(prompt), "%s> ", program_name);
 
-	if (snprintf(cfg_path, sizeof(cfg_path), "%s/.%s.conf",
-	    getenv("HOME"), program_name) >= sizeof(cfg_path))
-		errx(1, "cfg path is too long");
-
 	sigemptyset(&act.sa_mask);
 	sigaddset(&act.sa_mask, SIGINT);
 	sigaddset(&act.sa_mask, SIGTERM);
@@ -1404,6 +1417,27 @@ main(int argc, char **argv)
 
 	if (debug_level)
 		warnx("debug level set to %d", debug_level);
+
+	if (*cfg_path == '\0') {
+		if (getenv("XDG_CONFIG_HOME") != NULL &&
+		    strcmp(getenv("XDG_CONFIG_HOME"), "") != 0) {
+			if (snprintf(cfg_path, sizeof(cfg_path),
+			    "%s/%s/%s.conf",
+			    getenv("XDG_CONFIG_HOME"), program_name,
+			    program_name) >= sizeof(cfg_path))
+				errx(1, "XDG_CONFIG_HOME cfg path is too long");
+		} else if (getenv("HOME") != NULL &&
+		    strcmp(getenv("HOME"), "") != 0) {
+			if (snprintf(cfg_path, sizeof(cfg_path),
+			    "%s/.config/%s/%s.conf",
+			    getenv("HOME"), program_name, program_name)
+			    >= sizeof(cfg_path))
+				errx(1, "HOME cfg path is too long");
+		} else {
+			errx(1, "neither HOME nor XDG_CONFIG_HOME is defined; "
+			    "specify the config path manually");
+		}
+	}
 
 	read_cfg();
 
