@@ -1,3 +1,19 @@
+ckrts (2.0.0) unstable; urgency=medium
+
+  v2.0.0
+  * Implemented safe_popen() which doesn't invoke a shell
+  * Replaced the backup db by a backup command, so we can let the user decide
+    how to backup their data
+  * Add an example shell script to perform the required encryption/decryption
+    operations.
+  * Fix leak when clearing the JSON db. We should use json_decref()
+  * Fix a few typos and command outputs
+  * Added a "save" command so we can save without exiting if needed.
+  * Default the config path as per freedesktop standards (XDG_CONFIG_HOME)
+  * coverity fixes
+
+ -- Pascal Lalonde <plalonde@overnet.ca>  Sat, 11 Mar 2023 22:02:35 -0500
+
 ckrts (1.4.6) unstable; urgency=medium
 
   * Version 1.4.6
