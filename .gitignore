@@ -4,3 +4,6 @@ ckrts
 ckrts.1
 gdb.ckrts
 .build/
+.cookie
+cov-int/
+coverity*
