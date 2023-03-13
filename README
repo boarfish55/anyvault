@@ -19,3 +19,5 @@ Library dependencies (and corresponding license):
 
 To build:
 $ make
+
+Author: Pascal Lalonde - plalonde@overnet.ca
