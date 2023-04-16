@@ -2,12 +2,13 @@ Source: anyvault
 Section: misc
 Priority: optional
 Maintainer: Pascal Lalonde <plalonde@overnet.ca>
-Build-Depends: debhelper (>= 9), libjansson-dev (>= 2.9), libreadline-dev, pkg-config, libxtst-dev, libx11-dev
+Build-Depends: debhelper-compat (= 13), libjansson-dev (>= 2.9), libreadline-dev, pkg-config, libxtst-dev, libx11-dev
 Standards-Version: 4.5.1
+Rules-Requires-Root: no
 
 Package: anyvault
 Architecture: any
-Depends: ${shlibs:Depends}, ${misc:Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends}, libjansson4 (>= 2.13.1), libreadline8, libx11-6, libxtst6, libbsd0 (>= 0.11.3)
 Description: A text-based secrets manager
  A text-based secrets manager, which stores secrets in a JSON file and
  uses standard command-line tools for encryption and decryption.
