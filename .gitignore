@@ -1,8 +1,7 @@
 .vimtags
 TODO
 ckrts
-ckrts.1
-gdb.ckrts
+gdb.*
 .build/
 .cookie
 cov-int/

@@ -12,16 +12,16 @@
 # If using GnuPG, not that you may need to set the GPG_TTY environment
 # variable if running from a terminal.
 #
-encrypt_cmd: /home/plalonde/prog/ckrts/ckrts_backend_gpg.sh encrypt
+encrypt_cmd: /home/plalonde/prog/anyvault/anyvault_backend_gpg.sh encrypt
 
 # Decryption command. The command must write the decrypted output to STDOUT.
 # It is recommended that the decryption command also verifies signatures on
 # the database to ensure we are not dealing with a fake.
-decrypt_cmd: /home/plalonde/prog/ckrts/ckrts_backend_gpg.sh decrypt
+decrypt_cmd: /home/plalonde/prog/anyvault/anyvault_backend_gpg.sh decrypt
 
 # After a successful database save (and only once per session), we perform
 # a backup using the following command.
-backup_cmd: /bin/cp /home/plalonde/prog/ckrts/ckrts.json.sample.gpg /home/plalonde/prog/ckrts/ckrts.json.sample.gpg~
+backup_cmd: /bin/cp /home/plalonde/prog/anyvault/anyvault.json.sample.gpg /home/plalonde/prog/anyvault/anyvault.json.sample.gpg~
 
 # Command to paste secrets to the clipboard. The command has to read the
 # secret from STDIN. Ideally, it should not keep the secret forever.
@@ -33,7 +33,7 @@ paste_cmd: /usr/bin/xclip -quiet
 timeout: 300
 
 # When using the 'xtype' command to have X simulate keystrokes for typing
-# the password, use this hotkey to signal ckrts to begin typing.
+# the password, use this hotkey to signal anyvault to begin typing.
 # The key names can be found in /usr/include/X11/keysymdef.h, or
 # https://cgit.freedesktop.org/xorg/proto/x11proto/tree/keysymdef.h,
 # without the "XK_" prefix.
