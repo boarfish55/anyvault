@@ -1,6 +1,6 @@
 Format: https://www.debian.org/doc/packaging-manuals/copyright-format/1.0/
-Upstream-Name: ckrts
-Source: <https://github.com/boarfish55/ckrts>
+Upstream-Name: anyvault
+Source: <https://github.com/boarfish55/anyvault>
 
 Files: *
 Copyright: 2019-2021 Pascal Lalonde <plalonde@overnet.ca>

@@ -1,11 +1,11 @@
-Source: ckrts
+Source: anyvault
 Section: misc
 Priority: optional
 Maintainer: Pascal Lalonde <plalonde@overnet.ca>
 Build-Depends: debhelper (>= 9), libjansson-dev (>= 2.9), libreadline-dev, pkg-config, ronn, libxtst-dev, libx11-dev
 Standards-Version: 3.9.8
 
-Package: ckrts
+Package: anyvault
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
 Description: A text-based secrets manager
