@@ -1,5 +1,5 @@
 PROGNAME=anyvault
-VERSION=2.0.0
+VERSION=2.0.1
 DESTDIR=
 prefix=~
 
@@ -16,7 +16,7 @@ $(PROGNAME): $(PROGNAME).c
 		$(PROGNAME).c -g -o $(PROGNAME) \
 		`pkg-config --libs 'jansson >= 2.9' x11 xtst` \
 		-lreadline \
-		-Wall
+		-Wall -Wl,-z,relro -Wl,-z,now
 
 $(PROGNAME)-static: $(PROGNAME).c
 	gcc -static -DPROGNAME=\"$(PROGNAME)\" \
@@ -26,7 +26,7 @@ $(PROGNAME)-static: $(PROGNAME).c
 		-o $(PROGNAME)-static \
 		-lreadline -lncurses -ltinfo -pthread \
 		`pkg-config --static --libs 'jansson >= 2.9' x11 xtst` \
-		-Wall
+		-Wall -Wl,-z,relro -Wl,-z,now
 
 install: $(PROGNAME)
 	install -D -m 0755 -s $(PROGNAME) $(DESTDIR)$(prefix)/bin/$(PROGNAME)
