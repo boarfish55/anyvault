@@ -1,5 +1,5 @@
 /*
- *  ckrts -- a command-line password manager.
+ *  anyvault -- a command-line password manager.
  *
  *  Copyright (C) 2019-2023 Pascal Lalonde <plalonde@overnet.ca>
  *

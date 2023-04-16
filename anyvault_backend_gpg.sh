@@ -1,6 +1,6 @@
 #!/bin/sh
 #
-# ckrts -- a command-line password manager.
+# anyvault -- a command-line password manager.
 #
 # Copyright (C) 2019-2023 Pascal Lalonde <plalonde@overnet.ca>
 #
@@ -18,7 +18,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 PATH=/bin:/usr/bin
-db=/home/plalonde/prog/ckrts/ckrts.json.sample.gpg
+db=/home/plalonde/prog/anyvault/anyvault.json.sample.gpg
 
 usage() {
 	echo "Usage: $(basename $0) -h <command>"
@@ -51,12 +51,12 @@ fi
 encrypt() {
 	umask 0077
 
-	tmpdb=`mktemp -t ckrts.XXXXXX`
+	tmpdb=`mktemp -t anyvault.XXXXXX`
 	[ $? -ne 0 ] && exit 1
 
 	# Of course you wouldn't put the passphrase here; this is only an
 	# example.
-	gpg --batch --yes -c --passphrase ckrts -o $tmpdb -
+	gpg --batch --yes -c --passphrase anyvault -o $tmpdb -
 	if [ $? -ne 0 ]; then
 		rm -f $tmpdb
 		exit 1

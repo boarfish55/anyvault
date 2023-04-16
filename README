@@ -1,4 +1,4 @@
-ckrts lets you manage a JSON database of secrets using an external
+Anyvault lets you manage a JSON database of secrets using an external
 encryption/decryption command (such as GnuPG).
 
 There are three ways to retrieve stored passwords:
@@ -10,6 +10,8 @@ There are three ways to retrieve stored passwords:
    Emulates user keystrokes using X11's XTEST extension. Will not work
    if you don't have XTEST. This can be seen with the 'xdpyinfo' utility.
 
+See the LICENSE file for licensing information.
+
 Library dependencies (and corresponding license):
 - libjansson-dev >= 2.9 (Expat)
 - libreadline-dev (GPL-3)
@@ -19,3 +21,5 @@ Library dependencies (and corresponding license):
 
 To build:
 $ make
+
+Author: Pascal Lalonde <plalonde@overnet.ca>

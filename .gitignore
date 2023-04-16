@@ -1,6 +1,8 @@
 .vimtags
 TODO
-ckrts
-ckrts.1
-gdb.ckrts
+anyvault
+gdb.*
 .build/
+.cookie
+cov-int/
+coverity*
