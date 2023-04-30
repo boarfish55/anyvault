@@ -1,3 +1,10 @@
+anyvault (2.0.2-1) unstable; urgency=medium
+
+  * Create man page
+  * Do the backup before the first save in a session
+
+ -- Pascal Lalonde <plalonde@overnet.ca>  Sun, 30 Apr 2023 15:34:16 -0400
+
 anyvault (2.0.1-3) unstable; urgency=medium
 
   * Update deps

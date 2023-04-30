@@ -9,6 +9,7 @@ Rules-Requires-Root: no
 Package: anyvault
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}, libjansson4 (>= 2.13.1), libreadline8, libx11-6, libxtst6, libbsd0 (>= 0.11.3)
+Recommends: gnupg
 Description: A text-based secrets manager
  A text-based secrets manager, which stores secrets in a JSON file and
  uses standard command-line tools for encryption and decryption.
