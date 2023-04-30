@@ -1,0 +1,98 @@
+.Dd $Mdocdate$
+.Dt ANYVAULT 1 URM
+.Os ANYVAULT
+.Sh NAME
+.Nm anyvault
+.Nd a password manager with a flexible storage backend
+.Sh SYNOPSIS
+.Nm
+[options]
+.Sh DESCRIPTION
+.Nm
+is a password manager that uses external commands to act as its storage
+backend. Three separate commands need to be provided in the configuration file:
+.Bl -bullet -width 2n
+.It
+an encrypt command that reads the JSON database on STDIN
+.It
+a decrypt command that outputs the JSON database on STDOUT
+.It
+a backup command that is called before the first encrypt in a session.
+.El
+The database never persists in-memory. It is unloaded as soon as possible
+and memory is overwritten with random bytes.
+
+Launching the program leads to an an interactive prompt where commands can
+be entered to manage and access secrets. The commands are:
+.Bl -tag -width 6n -offset 2n
+.It add
+Add a new secret. The user will be prompted for various fields including
+the secret itself. Values are limited in length as per the max_value_length
+parameter from the configuration file.
+.It change <entry>
+Change one or multiple fields of the specified secret entry.
+.It delete <entry>
+Delete the specified secret entry.
+.It help
+Prints a list of available commands.
+.It list
+Lists all secret entries.
+.It paste <entry>
+Sends the specified entry's secret field to a paste command's STDIN. The
+command invoked depends on the paste_cmd value of the configuration file.
+.It quit
+Quits the
+.Nm session.
+.It rename <entry>
+Rename an entry to another name which will be asked interactively.
+.It save
+Save the database using the external command specified in the configuration
+as encrypt_cmd.
+.It show <entry>
+Show the non-secret fields of the entry specified as an argument.
+.It showall <entry>
+Show all the fields of the entry specified as an argument, including the secret.
+.It xtype <entry>
+Use the X11 XTEST extension to emulate keypresses with the sequence of
+characters stored in the secret. The command will not immediately start
+sending keypresses; the user should first bring the cursor in the right place
+then press the hotkey as specified in configuration file in the
+xtype_hotkey parameter. The hotkey specified in the xtype_esc value can
+be used to cancel sending keys.
+.El
+
+The session will terminate automatically after a number of seconds has passed,
+as specified in the timeout parameter in the configuration file.
+
+Command-line options are:
+.Bl -tag -width 6n -offset 2n
+.It -h
+Prints help
+.It -v
+Prints version
+.It -d
+Increase debug output
+.It -c <configuration path>
+Provide an alternate configuration path; the default is set according to the
+XDG Base Directory Specification (typically under $HOME/.config/anyvault).
+.It -x
+Skip permission and ownership checks on the configuration file. By default,
+.Nm
+will refuse to start if the configuration is owned by another user or if
+other users have read access to it.
+.It -X
+Don't disable core dump creation on crash. By default RLIMIT_CORE is set to
+zero (disabling core dumps).
+.El
+.Sh FILES
+.Bl -tag -offset 2n -width 6n
+.It /usr/share/doc/anyvault/examples/anyvault.conf.sample
+Example configuration file
+.It /usr/share/doc/anyvault/examples/anyvault_backend_gpg.sh
+Example storage backend using GnuPG
+.El
+.Sh BUGS
+In some cases, the xtype command doesn't emit the right sequence of characters.
+This happens on occasion on some sites in some browsers.
+.Sh AUTHORS
+.An Pascal Lalonde <plalonde@overnet.ca>
