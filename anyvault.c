@@ -588,6 +588,27 @@ save_db()
 	pid_t   child;
 	int     encode_failed = 0;
 
+	/* We only do this once per run, even if we save multiple times */
+	if (!db_backup_done && backup_cmd != NULL) {
+		if (debug_level)
+			warnx("backing up before saving");
+		if ((cmd_parts = str_split(backup_cmd)) == NULL)
+			errx(1, "str_split");
+		status = spawn((char *const *)cmd_parts);
+		if (WIFEXITED(status)) {
+			if (WEXITSTATUS(status) != 0) {
+				warnx("backup failed with status %d; "
+				    "command='%s'", WEXITSTATUS(status),
+				    backup_cmd);
+			} else
+				db_backup_done = 1;
+		} else {
+			warnx("backup failed with signal %d; "
+			    "command='%s'", WTERMSIG(status), backup_cmd);
+		}
+		free(cmd_parts);
+	}
+
 	if (encrypt_cmd == NULL) {
 		warnx("no encryption command defined; "
 		    "you will not be able to save");
@@ -639,27 +660,6 @@ again:
 
 	if (encode_failed)
 		return;
-
-	/* We only do this once per run, even if we save multiple times */
-	if (!db_backup_done && backup_cmd != NULL) {
-		if (debug_level)
-			warnx("backing up before saving");
-		if ((cmd_parts = str_split(backup_cmd)) == NULL)
-			errx(1, "str_split");
-		status = spawn((char *const *)cmd_parts);
-		if (WIFEXITED(status)) {
-			if (WEXITSTATUS(status) != 0) {
-				warnx("backup failed with status %d; "
-				    "command='%s'", WEXITSTATUS(status),
-				    backup_cmd);
-			} else
-				db_backup_done = 1;
-		} else {
-			warnx("backup failed with signal %d; "
-			    "command='%s'", WTERMSIG(status), backup_cmd);
-		}
-		free(cmd_parts);
-	}
 
 	warnx("changes were saved");
 }
