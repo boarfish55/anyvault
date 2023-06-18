@@ -3,7 +3,7 @@ Section: misc
 Priority: optional
 Maintainer: Pascal Lalonde <plalonde@overnet.ca>
 Build-Depends: debhelper-compat (= 13), libjansson-dev (>= 2.9), libreadline-dev, pkg-config, libxtst-dev, libx11-dev
-Standards-Version: 4.5.1
+Standards-Version: 4.6.2
 Rules-Requires-Root: no
 
 Package: anyvault
