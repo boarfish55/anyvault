@@ -1014,7 +1014,6 @@ paste(json_t *obj)
 	if (v == NULL) {
 		warnx("could not get secret");
 		fclose(cmd_fd);
-		free(cmd_parts);
 		wipe_mem(iobuf);
 		return;
 	}
