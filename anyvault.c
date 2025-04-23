@@ -783,13 +783,14 @@ xtype(json_t *obj)
 	json_t      *v;
 	const char **f;
 	const char  *secret;
-	wchar_t     *wcs = NULL, *wp;
-	size_t       wcs_l;
+	wchar_t     *wc_secret = NULL, *wp;
+	size_t       wc_secret_len;
 
 	Display     *xdpy;
 	const char  *d = getenv("DISPLAY");
 	int          min_kc, max_kc, ks_per_kc;
-	int          k, kc_i, ks_i, kc_empty, kc_scratch;
+	int          k, kc_i, ks_i, kc_empty;
+	int          kc_scratch;
 	int          kc_hot, kc_esc, ign_mod;
 	KeySym      *keysyms, *ks = NULL;
 	XEvent       ev;
@@ -839,17 +840,17 @@ xtype(json_t *obj)
 		goto exit_display;
 	}
 
-	if ((wcs_l = mbstowcs(NULL, secret, 0)) == (size_t) -1) {
+	if ((wc_secret_len = mbstowcs(NULL, secret, 0)) == (size_t) -1) {
 		warn("mbstowcs");
 		goto exit_display;
 	}
 
-	wcs = locked_mem((wcs_l + 1) * sizeof(wchar_t));
-	if (wcs == NULL) {
+	wc_secret = locked_mem((wc_secret_len + 1) * sizeof(wchar_t));
+	if (wc_secret == NULL) {
 		warn("locked_mem");
 		goto exit_display;
 	}
-	if (mbstowcs(wcs, secret, wcs_l + 1) == (size_t) -1) {
+	if (mbstowcs(wc_secret, secret, wc_secret_len + 1) == (size_t) -1) {
 		warn("mbstowcs");
 		goto exit_wcs;
 	}
@@ -859,6 +860,9 @@ xtype(json_t *obj)
 	printf("** NOTE: this has not been well tested with non-ASCII "
 	    "characters.\n");
 
+	/*
+	 * Grab secret-typing hotkey and ESC at the root.
+	 */
 	kc_hot = XKeysymToKeycode(xdpy, XStringToKeysym(xtype_hotkey));
 	kc_esc = XKeysymToKeycode(xdpy, XStringToKeysym(xtype_esc));
 	root_w = DefaultRootWindow(xdpy);
@@ -874,8 +878,10 @@ xtype(json_t *obj)
 	XGrabKey(xdpy, kc_esc, ign_mod, root_w, False,
 	    GrabModeAsync, GrabModeAsync);
 
+	/*
+	 * Block until we either get XK_Escape or our secret-typing hotkey.
+	 */
 	XSelectInput(xdpy, root_w, KeyPressMask|KeyReleaseMask);
-
 	for (;;) {
 		XNextEvent(xdpy, &ev);
 		if (ev.type == KeyPress) {
@@ -892,11 +898,15 @@ xtype(json_t *obj)
 	XSelectInput(xdpy, root_w, 0);
 	XSync(xdpy, False);
 
+	/* Get a list of all keysyms for the current keyboard map */
 	XDisplayKeycodes(xdpy, &min_kc, &max_kc);
 	keysyms = XGetKeyboardMapping(xdpy, min_kc, max_kc - min_kc + 1,
 	    &ks_per_kc);
 
-	/* Find unused keycode to use as scratch space */
+	/*
+	 * Find two unused keycode to use as scratch space; all keysyms should
+	 * be zero for that keycode, otherwise we find another one.
+	 */
 	for (kc_i = min_kc; kc_i < max_kc; kc_i++) {
 		kc_empty = 1;
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++) {
@@ -910,21 +920,32 @@ xtype(json_t *obj)
 			break;
 	}
 	XFree(keysyms);
+
 	if (kc_i == max_kc) {
 		warnx("no empty keycode; cannot xtype");
 		goto exit_wcs;
 	}
 	kc_scratch = kc_i;
 
+	/* Create our fake keysyms for this keycode */
 	ks = locked_mem(sizeof(KeySym) * ks_per_kc);
 	if (ks == NULL) {
 		warn("malloc");
 		goto exit_wcs;
 	}
 
-	for (wp = wcs; *wp != 0; wp++) {
-		if (!iswprint(*wp) || !XKeysymToString(*wp))
+	/*
+	 * For each character in our secret, change the current keyboard
+	 * mapping so that our scratch keycode gets all its keysyms set
+	 * to that character. This way we don't need to bother about what
+	 * modifiers are set.
+	 */
+	for (wp = wc_secret; *wp != 0; wp++) {
+		if (!iswprint(*wp) || !XKeysymToString(*wp)) {
+			warnx("found non-printable character, "
+			    "or XKeysymToString() failed");
 			continue;
+		}
 
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
 			ks[ks_i] = *wp;
@@ -937,8 +958,8 @@ xtype(json_t *obj)
 		XkbLockGroup(xdpy, XkbUseCoreKbd, 0);
 		XTestFakeKeyEvent(xdpy, kc_scratch, True, CurrentTime);
 		XkbLockGroup(xdpy, XkbUseCoreKbd, saved_kbgroup);
-		XSync(xdpy, False);
-		usleep(20000);
+		XFlush(xdpy);
+		usleep(10000);
 
 		/* Release. */
 		XkbGetState(xdpy, XkbUseCoreKbd, &kbstate);
@@ -946,8 +967,8 @@ xtype(json_t *obj)
 		XkbLockGroup(xdpy, XkbUseCoreKbd, 0);
 		XTestFakeKeyEvent(xdpy, kc_scratch, False, CurrentTime);
 		XkbLockGroup(xdpy, XkbUseCoreKbd, saved_kbgroup);
-		XSync(xdpy, False);
-		usleep(20000);
+		XFlush(xdpy);
+		usleep(80000);
 
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
 			ks[ks_i] = 0;
@@ -956,7 +977,7 @@ xtype(json_t *obj)
 	}
 	wipe_mem(ks);
 exit_wcs:
-	wipe_mem(wcs);
+	wipe_mem(wc_secret);
 exit_display:
 	XCloseDisplay(xdpy);
 }
