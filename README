@@ -10,6 +10,52 @@ There are three ways to retrieve stored passwords:
    Emulates user keystrokes using X11's XTEST extension. Will not work
    if you don't have XTEST. This can be seen with the 'xdpyinfo' utility.
 
+Security considerations
+-----------------------
+anyvault assumes every process running as your user is trusted. The X11
+server has no isolation between clients connected to the same $DISPLAY,
+so any local process running as you can attack secret retrieval. There
+is no defense against this at the application level; both retrieval
+mechanisms are exposed:
+
+- 'xtype' rewrites a scratch keycode in the global X keyboard map for
+  each character it sends, then zeroes it. A local X client polling
+  XGetKeyboardMapping in a tight loop can reconstruct the secret.
+  Exposure is transient (a few milliseconds per character) and does not
+  persist anywhere on disk.
+
+- 'paste' writes the secret to an X selection (typically CLIPBOARD or
+  PRIMARY via xclip/xsel). Any local X client can read it for as long
+  as it stays in the selection. Two amplifiers to be aware of:
+
+    * Clipboard managers (clipit, parcellite, xfce4-clipman, Klipper,
+      GNOME's clipboard indicator, etc.) commonly snapshot selections
+      and write the history to disk, often unencrypted under ~/.cache
+      or ~/.local/share. This turns a transient leak into a persistent
+      one. Disable or configure your clipboard manager to ignore
+      anyvault output if you use 'paste'.
+
+    * Web browsers expose the clipboard to JavaScript. A focused
+      malicious page can read pasted content via paste-event listeners,
+      and some browsers expose navigator.clipboard.readText() under
+      user-gesture rules. There is no equivalent browser-side API for
+      reading the X keymap.
+
+  Limit the window by using paste programs that release the selection
+  after one consumer reads it (e.g. 'xclip -selection clipboard -loops 1').
+
+Neither mechanism is meaningfully safer than the other in general;
+pick the one that matches your environment. If your desktop runs a
+disk-persisting clipboard manager, 'xtype' is likely the lesser
+exposure. If you regularly run untrusted code that could be polling
+the keymap, 'paste' with a one-shot clipboard tool may be preferable.
+
+The decrypted database is held only in memory while the program is
+running, in mlock'd pages where possible, and is zeroed (via
+explicit_bzero) before being freed. Core dumps are disabled by
+default. Neither protection survives a process running as your user
+that can ptrace() anyvault.
+
 See the LICENSE file for licensing information.
 
 Library dependencies (and corresponding license):

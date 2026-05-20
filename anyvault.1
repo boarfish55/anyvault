@@ -19,8 +19,10 @@ a decrypt command that outputs the JSON database on STDOUT
 .It
 a backup command that is called before the first encrypt in a session.
 .El
-The database never persists in-memory. It is unloaded as soon as possible
-and memory is overwritten with random bytes.
+The decrypted database is unloaded as soon as possible and its memory is
+zeroed before being freed. See
+.Sx SECURITY CONSIDERATIONS
+for the full threat model.
 
 Launching the program leads to an an interactive prompt where commands can
 be entered to manage and access secrets. The commands are:
@@ -40,6 +42,9 @@ Lists all secret entries.
 .It paste <entry>
 Sends the specified entry's secret field to a paste command's STDIN. The
 command invoked depends on the paste_cmd value of the configuration file.
+See
+.Sx SECURITY CONSIDERATIONS
+for the threat model.
 .It quit
 Quits the
 .Nm session.
@@ -58,7 +63,9 @@ characters stored in the secret. The command will not immediately start
 sending keypresses; the user should first bring the cursor in the right place
 then press the hotkey as specified in configuration file in the
 xtype_hotkey parameter. The hotkey specified in the xtype_esc value can
-be used to cancel sending keys.
+be used to cancel sending keys. See
+.Sx SECURITY CONSIDERATIONS
+for the threat model.
 .El
 
 The session will terminate automatically after a number of seconds has passed,
@@ -91,8 +98,95 @@ Example configuration file
 .It /usr/share/doc/anyvault/examples/anyvault_backend_gpg.sh
 Example storage backend using GnuPG
 .El
+.Sh SECURITY CONSIDERATIONS
+.Nm
+assumes every process running as the invoking user is trusted. The X11
+server has no isolation between clients connected to the same
+.Ev DISPLAY ,
+so any local process running as the user can attack secret retrieval.
+There is no application-level defense against this; both retrieval
+mechanisms are exposed.
+.Pp
+The
+.Cm xtype
+command rewrites a scratch keycode in the global X keyboard map for
+each character it sends, then zeroes it. A local X client polling
+.Xr XGetKeyboardMapping 3
+in a tight loop can reconstruct the secret. Exposure is transient (a
+few milliseconds per character) and does not persist on disk.
+.Pp
+The
+.Cm paste
+command writes the secret to an X selection (typically CLIPBOARD or
+PRIMARY, via tools like
+.Xr xclip 1
+or
+.Xr xsel 1 ) .
+Any local X client can read it until the selection is replaced. Two
+amplifiers are worth noting:
+.Bl -bullet -width 2n
+.It
+Clipboard managers (clipit, parcellite, xfce4-clipman, Klipper, etc.)
+commonly snapshot selections and write the history to disk, often
+unencrypted under
+.Pa ~/.cache
+or
+.Pa ~/.local/share .
+This turns a transient leak into a persistent one. Configure your
+clipboard manager to ignore
+.Nm
+output, or disable it, if you use
+.Cm paste .
+.It
+Web browsers expose the clipboard to JavaScript. A focused malicious
+page can read pasted content via paste-event listeners, and some
+browsers expose
+.Li navigator.clipboard.readText()
+under user-gesture rules. There is no equivalent browser-side API for
+reading the X keymap.
+.El
+.Pp
+Limit clipboard exposure by using paste programs that release the
+selection after one read, e.g.
+.Ql xclip -selection clipboard -loops 1 .
+.Pp
+Neither mechanism is meaningfully safer than the other in general. If
+your desktop runs a disk-persisting clipboard manager,
+.Cm xtype
+is likely the lesser exposure. If you regularly run untrusted code
+that could be polling the keymap,
+.Cm paste
+with a one-shot clipboard tool may be preferable.
+.Pp
+The decrypted database is held only in memory while
+.Nm
+is running, in
+.Xr mlock 2 Ns 'd
+pages where possible, and is zeroed via
+.Xr explicit_bzero 3
+before being freed. Core dumps are disabled by default; see the
+.Fl X
+flag. Neither protection survives a process running as the user that
+can
+.Xr ptrace 2
+.Nm .
 .Sh BUGS
-In some cases, the xtype command doesn't emit the right sequence of characters.
-This happens on occasion on some sites in some browsers.
+The
+.Cm xtype
+command uses the X11 XTEST extension via
+.Xr XTestFakeKeyEvent 3
+to inject synthetic keystrokes. Modern applications, notably web
+browsers, may treat XTEST-injected events as untrusted and filter them
+out for security-sensitive contexts such as password fields, autofill
+targets, or sandboxed inputs. When this happens, the target receives no
+input at all, regardless of focus state. There is no application-level
+workaround; use the
+.Cm paste
+command in those cases instead.
+.Pp
+.Cm xtype
+may also occasionally emit a wrong sequence of characters in
+applications that process keyboard-mapping changes and key events on
+separate threads, producing duplicated or skipped characters.
 .Sh AUTHORS
 .An Pascal Lalonde <plalonde@overnet.ca>

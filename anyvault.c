@@ -26,6 +26,7 @@
 #include <fcntl.h>
 #include <err.h>
 #include <errno.h>
+#include <inttypes.h>
 #include <limits.h>
 #include <poll.h>
 #include <signal.h>
@@ -52,7 +53,7 @@ const char *version = VERSION;
 
 char    cfg_path[PATH_MAX] = "";
 int     timeout = 300;
-size_t  max_value_length = 2048;
+size_t  max_value_length = 16384;
 int     no_mlock = 0;
 int     permission_check = 1;
 int     enable_core = 0;
@@ -64,8 +65,14 @@ char   *paste_cmd = NULL;
 char   *xtype_hotkey = "F11";
 char   *xtype_esc = "Escape";
 
-int         db_backup_done = 0;
-json_t     *db = NULL;
+int     db_backup_done = 0;
+json_t *db = NULL;
+
+struct termios saved_termios;
+
+volatile sig_atomic_t timed_out = 0;
+volatile sig_atomic_t in_readline = 0;
+
 const char *fields[] = { "notes", "url", "login", "secret", NULL };
 
 void save_db();
@@ -83,7 +90,9 @@ print_help()
 	printf("\t-X\t\t\tDon't disable core dump creation (insecure)\n");
 }
 
-// Used to track how much mlock'd memory we have. Used for reporting only.
+/*
+ * Used to track how much mlock'd memory we have. Used for reporting only.
+ */
 static size_t locked_allocated = 0;
 
 /*
@@ -115,49 +124,28 @@ locked_mem(size_t s)
 			    locked_allocated);
 	}
 
-	return p + sizeof(s);
+	return (char *)p + sizeof(s);
 }
 
 /*
- * Opposite to locked_mem(), this overwrites to-be-freed memory with random
- * bytes, calls munlock() and finally frees the memory. The amount of bytes
+ * Opposite to locked_mem(), this overwrites to-be-freed memory with zeroes
+ * calls munlock() and finally frees the memory. The amount of bytes
  * is saved at (buf - sizeof(size_t)).
  */
 void
 wipe_mem(void *buf)
 {
-	int      fd;
-	ssize_t  r;
-	size_t   pos;
-	size_t   len;
-	void    *p;
+	size_t  len;
+	void   *p;
 
 	if (buf == NULL)
 		return;
 
-	p = buf - sizeof(len);
+	p = (char *)buf - sizeof(len);
 	len = *((size_t *)p);
 
-	if ((fd = open("/dev/urandom", O_RDONLY)) == -1) {
-		warn("could not open /dev/urandom");
-		warnx("cannot wipe buffer at address %p", buf);
-		goto end;
-	}
+	explicit_bzero(buf, len);
 
-	for (pos = 0; pos < len; pos += r) {
-		r = read(fd, buf + pos, len - pos);
-		if (r <= 0) {
-			if (errno == EAGAIN)
-				continue;
-			warn("cannot wipe buffer at address %p; read", buf);
-			/* fallback to zeroes */
-			explicit_bzero(buf, len);
-			goto end;
-		}
-	}
-end:
-	if (fd != -1)
-		close(fd);
 	if (!no_mlock) {
 		if (munlock(p, len + sizeof(len)) == -1)
 			warn("munlock");
@@ -168,6 +156,54 @@ end:
 			    locked_allocated);
 	}
 	free(p);
+}
+
+void
+restore_termios()
+{
+	tcsetattr(STDIN_FILENO, TCSANOW, &saved_termios);
+}
+
+static size_t
+load_json(void *buf, size_t bufsz, void *data)
+{
+	int     fd = *(int *)data;
+	size_t  offset = 0;
+	ssize_t r;
+
+	for (;;) {
+		r = read(fd, buf + offset, bufsz - offset);
+		if (r == -1) {
+			if (errno == EINTR && !timed_out)
+				continue;
+			warn("%s: read", __func__);
+			return (size_t)-1;
+		}
+		if (r == 0)
+			break;
+		offset += r;
+	}
+	return offset;
+}
+
+int
+dump_json(const char *buf, size_t bufsz, void *data)
+{
+	int     fd = *(int *)data;
+	size_t  offset = 0;
+	ssize_t r;
+
+	while (offset < bufsz) {
+		r = write(fd, buf + offset, bufsz - offset);
+		if (r == -1) {
+			if (errno == EINTR && !timed_out)
+				continue;
+			warn("%s: write", __func__);
+			return -1;
+		}
+		offset += r;
+	}
+	return 0;
 }
 
 char **
@@ -209,14 +245,38 @@ str_split(const char *str)
 int
 spawn(char *const program[])
 {
-	pid_t pid;
-	int   null_fd;
-	int   status;
+	pid_t            pid;
+	struct sigaction act;
+	int              null_fd;
+	int              err_fd = dup(STDERR_FILENO);
+	int              status;
+
+	if (err_fd == -1) {
+		warn("dup");
+		return -1;
+	}
+	if (fcntl(err_fd, F_SETFD, FD_CLOEXEC) == -1) {
+		warn("fcntl");
+		close(err_fd);
+		return -1;
+	}
 
 	if ((pid = fork()) == -1) {
 		warn("fork");
 		return -1;
 	} else if (pid == 0) {
+		bzero(&act, sizeof(act));
+		act.sa_handler = SIG_DFL;
+		if (sigaction(SIGTERM, &act, NULL) == -1) {
+			warn("sigaction");
+			_exit(1);
+		}
+
+		if (chdir("/") == -1) {
+			warn("chdir");
+			_exit(1);
+		}
+
 		if ((null_fd = open("/dev/null", O_RDWR)) == -1) {
 			warn("open");
 			_exit(1);
@@ -237,53 +297,95 @@ spawn(char *const program[])
 		if (null_fd > 2)
 			close(null_fd);
 
-		if (chdir("/") == -1) {
-			warn("chdir");
-			_exit(1);
+		if (err_fd != 3) {
+			if (dup2(err_fd, 3) == -1) {
+				/* No way to print anything to stderr now. */
+				_exit(127);
+			}
+			close(err_fd);
+			err_fd = 3;
 		}
 
+		closefrom(4);
+
 		if (execv(program[0], program) == -1) {
-			warn("execv: %s", program[0]);
+			dprintf(err_fd, "execv: %s: %s\n",
+			    program[0], strerror(errno));
 			_exit(1);
 		}
 	}
+	close(err_fd);
 again:
 	if (waitpid(pid, &status, 0) == -1) {
-		if (errno == EINTR) {
-			warn("waitpid");
+		if (errno == EINTR && !timed_out)
 			goto again;
-		}
-		err(1, "waitpid");
+		warn("waitpid");
+		return -1;
 	}
 	return status;
 }
 
-FILE *
-safe_popen(char *const program[], const char *type, pid_t *pid)
+int
+safe_popen(char *const program[], int write_end, int cloexec, pid_t *pid)
 {
-	FILE *f;
-	int   p_io[2];
-	int   null_fd;
+	int              fd;
+	int              p_io[2];
+	int              null_fd;
+	struct sigaction act;
+	int              err_fd = dup(STDERR_FILENO);
+
+	if (err_fd == -1) {
+		warn("dup");
+		return -1;
+	}
+	if (fcntl(err_fd, F_SETFD, FD_CLOEXEC) == -1) {
+		warn("fcntl");
+		close(err_fd);
+		return -1;
+	}
+
+	tcflush(STDIN_FILENO, TCIFLUSH);
 
 	if (pipe(p_io) == -1) {
 		warn("pipe");
-		return NULL;
+		return -1;
 	}
-
-	fflush(stdin);
 
 	if ((*pid = fork()) == -1) {
 		warn("fork");
 		close(p_io[0]);
 		close(p_io[1]);
-		return NULL;
+		close(err_fd);
+		return -1;
 	} else if (*pid == 0) {
+		bzero(&act, sizeof(act));
+		act.sa_handler = SIG_DFL;
+		if (sigaction(SIGTERM, &act, NULL) == -1) {
+			warn("sigaction");
+			_exit(1);
+		}
+
 		if ((null_fd = open("/dev/null", O_RDWR)) == -1) {
 			warn("open");
 			_exit(1);
 		}
 
-		if (type[0] == 'r') {
+		/*
+		 * Parent wants a write-end pipe, so as the child
+		 * we have to close p_io[1] and assign p_io[0] to
+		 * our stdin.
+		 */
+		if (write_end) {
+			if (dup2(null_fd, STDOUT_FILENO) == -1) {
+				warn("dup2");
+				_exit(1);
+			}
+			if (dup2(p_io[0], STDIN_FILENO) == -1) {
+				warn("dup2");
+				_exit(1);
+			}
+			close(p_io[1]);
+		} else {
 			if (dup2(null_fd, STDIN_FILENO) == -1) {
 				warn("dup2");
 				_exit(1);
@@ -295,16 +397,9 @@ safe_popen(char *const program[], const char *type, pid_t *pid)
 			close(p_io[0]);
 		}
 
-		if (type[0] == 'w') {
-			if (dup2(null_fd, STDOUT_FILENO) == -1) {
-				warn("dup2");
-				_exit(1);
-			}
-			if (dup2(p_io[0], STDIN_FILENO) == -1) {
-				warn("dup2");
-				_exit(1);
-			}
-			close(p_io[1]);
+		if (chdir("/") == -1) {
+			warn("chdir");
+			_exit(1);
 		}
 
 		if (dup2(null_fd, STDERR_FILENO) == -1) {
@@ -315,53 +410,43 @@ safe_popen(char *const program[], const char *type, pid_t *pid)
 		if (null_fd > 2)
 			close(null_fd);
 
-		if (chdir("/") == -1) {
-			warn("chdir");
-			_exit(1);
+		/*
+		 * We want to keep only stdin/out/err, and err_fd. Anything
+		 * else is something that shouldn't be in the child.
+		 */
+		if (err_fd != 3) {
+			if (dup2(err_fd, 3) == -1) {
+				/* No way to print anything to stderr now. */
+				_exit(127);
+			}
+			close(err_fd);
+			err_fd = 3;
 		}
+		closefrom(4);
 
 		if (execv(program[0], program) == -1) {
-			warn("execv: %s", program[0]);
+			dprintf(err_fd, "execv: %s: %s\n",
+			    program[0], strerror(errno));
 			_exit(1);
 		}
 	}
 
-	if (type[0] == 'r') {
-		if ((f = fdopen(p_io[0], "r")) == NULL) {
-			warn("fdopen");
-			close(p_io[0]);
-			close(p_io[1]);
-			return NULL;
-		}
-		close(p_io[1]);
-		if (type[1] == 'e' &&
-		    fcntl(p_io[0], F_SETFD, FD_CLOEXEC) == -1) {
-			warn("fcntl");
-			fclose(f);
-			return NULL;
-		}
-	} else if (type[0] == 'w') {
-		if ((f = fdopen(p_io[1], "w")) == NULL) {
-			warn("fdopen");
-			close(p_io[0]);
-			close(p_io[1]);
-			return NULL;
-		}
+	close(err_fd);
+	if (write_end) {
+		fd = p_io[1];
 		close(p_io[0]);
-		if (type[1] == 'e' &&
-		    fcntl(p_io[1], F_SETFD, FD_CLOEXEC) == -1) {
-			warn("fcntl");
-			fclose(f);
-			return NULL;
-		}
 	} else {
-		errno = EINVAL;
-		close(p_io[0]);
+		fd = p_io[0];
 		close(p_io[1]);
-		return NULL;
 	}
 
-	return f;
+	if (cloexec && fcntl(fd, F_SETFD, FD_CLOEXEC) == -1) {
+		warn("fcntl");
+		close(fd);
+		return -1;
+	}
+
+	return fd;
 }
 
 char *
@@ -405,6 +490,23 @@ str_replace(const char *str, const char *search, const char *replace)
 err:
 	free(saved);
 	return NULL;
+}
+
+void
+reset_timer()
+{
+	struct itimerval exit_timer;
+
+	bzero(&exit_timer, sizeof(exit_timer));
+	exit_timer.it_value.tv_sec = timeout;
+	if (setitimer(ITIMER_REAL, &exit_timer, NULL) == -1) {
+		warn("setitimer");
+		return;
+	}
+
+	if (debug_level)
+		warnx("timer set to exit in %" PRIi64 " seconds",
+			exit_timer.it_value.tv_sec);
 }
 
 void
@@ -484,8 +586,12 @@ read_cfg()
 				err(1, "could not load paste command");
 		} else if (strcmp(p, "xtype_hotkey") == 0) {
 			xtype_hotkey = strdup(v);
+			if (xtype_hotkey == NULL)
+				err(1, "could not load xtype_hotkey");
 		} else if (strcmp(p, "xtype_esc") == 0) {
 			xtype_esc = strdup(v);
+			if (xtype_esc == NULL)
+				err(1, "could not load xtype_esc");
 		} else if (strcmp(p, "timeout") == 0) {
 			if (atoi(v) < 0)
 				warnx("invalid timeout specified");
@@ -499,7 +605,7 @@ read_cfg()
 			else
 				warnx("no_mlock must be 'yes' or 'no'");
 		} else if (strcmp(p, "max_value_length") == 0) {
-			if (atoi(v) < 0)
+			if (atoi(v) < 64)
 				warnx("invalid max_value_length specified; "
 				    "minimum is 64");
 			else
@@ -526,50 +632,6 @@ read_cfg()
 }
 
 void
-load_db()
-{
-	FILE          *cmd_fd;
-	pid_t          child;
-	int            status;
-	json_error_t   error;
-	char          *iobuf;
-	char         **cmd_parts;
-
-	if ((cmd_parts = str_split(decrypt_cmd)) == NULL)
-		errx(1, "str_split");
-	cmd_fd = safe_popen((char *const *)cmd_parts, "r", &child);
-	if (cmd_fd == NULL)
-		errx(1, "cannot decrypt");
-	free(cmd_parts);
-
-	iobuf = locked_mem(BUFSIZ);
-	if (iobuf == NULL)
-		err(1, "load_db");
-	setbuf(cmd_fd, iobuf);
-
-	db = json_loadf(cmd_fd, JSON_REJECT_DUPLICATES, &error);
-	if (db == NULL) {
-		wipe_mem(iobuf);
-		errx(1, "JSON parse error (line %d): %s\n",
-		    error.line, error.text);
-	}
-again:
-	if (waitpid(child, &status, 0) == -1) {
-		if (errno == EINTR) {
-			warn("waitpid");
-			goto again;
-		}
-		err(1, "waitpid");
-	}
-	fclose(cmd_fd);
-	wipe_mem(iobuf);
-	if (status != 0) {
-		errx(1, "decrypt command failed with code %d: %s",
-		    status, decrypt_cmd);
-	}
-}
-
-void
 clear_db()
 {
 	if (db != NULL) {
@@ -578,13 +640,59 @@ clear_db()
 	}
 }
 
+int
+load_db()
+{
+	int            cmd_fd;
+	pid_t          child;
+	int            status;
+	json_error_t   error;
+	char         **cmd_parts;
+	int            decode_success = 0;
+
+	if ((cmd_parts = str_split(decrypt_cmd)) == NULL)
+		errx(1, "str_split");
+	cmd_fd = safe_popen((char *const *)cmd_parts, 0, 1, &child);
+	if (cmd_fd == -1)
+		errx(1, "cannot decrypt");
+	free(cmd_parts);
+
+	db = json_load_callback(&load_json, &cmd_fd,
+	    JSON_REJECT_DUPLICATES, &error);
+	if (db == NULL) {
+		if (timed_out)
+			errx(1, "timeout while loading JSON");
+	} else
+		decode_success = 1;
+again:
+	if (waitpid(child, &status, 0) == -1) {
+		if (errno == EINTR && !timed_out)
+			goto again;
+		clear_db();
+		err(1, "waitpid");
+	}
+	close(cmd_fd);
+
+	if (WIFEXITED(status)) {
+		if (WEXITSTATUS(status) != 0)
+			warnx("decrypt command exited with code %d: %s",
+			    WEXITSTATUS(status), decrypt_cmd);
+		else if (!decode_success)
+			warnx("JSON parse error (line %d): %s",
+			    error.line, error.text);
+	} else {
+		warnx("decrypt command exited with signal %d: "
+		    "command='%s'", WTERMSIG(status), decrypt_cmd);
+	}
+	return decode_success;
+}
+
 void
 save_db()
 {
-	FILE   *cmd_fd;
+	int     cmd_fd;
 	char  **cmd_parts;
 	int     status;
-	char   *iobuf;
 	pid_t   child;
 	int     encode_failed = 0;
 
@@ -592,10 +700,14 @@ save_db()
 	if (!db_backup_done && backup_cmd != NULL) {
 		if (debug_level)
 			warnx("backing up before saving");
-		if ((cmd_parts = str_split(backup_cmd)) == NULL)
+		if ((cmd_parts = str_split(backup_cmd)) == NULL) {
+			clear_db();
 			errx(1, "str_split");
+		}
 		status = spawn((char *const *)cmd_parts);
-		if (WIFEXITED(status)) {
+		if (status == -1) {
+			warnx("backup status unknown");
+		} else if (WIFEXITED(status)) {
 			if (WEXITSTATUS(status) != 0) {
 				warnx("backup failed with status %d; "
 				    "command='%s'", WEXITSTATUS(status),
@@ -607,6 +719,10 @@ save_db()
 			    "command='%s'", WTERMSIG(status), backup_cmd);
 		}
 		free(cmd_parts);
+		if (!db_backup_done) {
+			warnx("changes NOT saved");
+			return;
+		}
 	}
 
 	if (encrypt_cmd == NULL) {
@@ -618,50 +734,50 @@ save_db()
 	if (debug_level)
 		warnx("saving: %s", encrypt_cmd);
 
-	iobuf = locked_mem(BUFSIZ);
-	if (iobuf == NULL) {
-		warn("save_db");
-		return;
-	}
-
-	if ((cmd_parts = str_split(encrypt_cmd)) == NULL)
+	if ((cmd_parts = str_split(encrypt_cmd)) == NULL) {
+		clear_db();
 		errx(1, "str_split");
-	cmd_fd = safe_popen((char *const *)cmd_parts, "w", &child);
-	if (cmd_fd == NULL) {
+	}
+	cmd_fd = safe_popen((char *const *)cmd_parts, 1, 1, &child);
+	if (cmd_fd == -1) {
 		warn("cannot encrypt");
 		free(cmd_parts);
-		wipe_mem(iobuf);
 		return;
 	}
 	free(cmd_parts);
 
-	setbuf(cmd_fd, iobuf);
-
-	if (json_dumpf(db, cmd_fd, JSON_INDENT(2) | JSON_SORT_KEYS) == -1) {
-		warnx("could not prepare JSON output while saving");
+	if (json_dump_callback(db, &dump_json, &cmd_fd,
+	    JSON_INDENT(2) | JSON_SORT_KEYS) == -1) {
+		if (timed_out)
+			warnx("timeout while writing JSON");
+		else
+			warnx("failed to write JSON output");
 		encode_failed = 1;
 	}
-	fclose(cmd_fd);
+	close(cmd_fd);
 again:
 	if (waitpid(child, &status, 0) == -1) {
-		if (errno == EINTR) {
-			warn("waitpid");
+		if (errno == EINTR && !timed_out)
 			goto again;
-		}
-		err(1, "waitpid");
+		warn("waitpid");
+		warnx("changes MAY NOT have been saved");
+		return;
 	}
 
-	wipe_mem(iobuf);
-	if (status != 0) {
-		warnx("encrypt command failed with code %d: '%s'",
-		    status, encrypt_cmd);
+	if (WIFEXITED(status)) {
+		if (WEXITSTATUS(status) != 0) {
+			warnx("encrypt command failed with code %d: %s",
+			    WEXITSTATUS(status), encrypt_cmd);
+			encode_failed = 1;
+		}
+	} else {
+		warnx("encrypt command exited with signal %d: "
+		    "command='%s'", WTERMSIG(status), encrypt_cmd);
 		encode_failed = 1;
 	}
 
-	if (encode_failed)
-		return;
-
-	warnx("changes were saved");
+	if (!encode_failed)
+		warnx("changes were saved");
 }
 
 json_t *
@@ -777,6 +893,38 @@ show_secret(json_t *obj, int hide_secret)
  *       "PPssword". This never happens in a terminal, always in a browser
  *       window so far.
  */
+int
+x_err_handler(Display *xdpy, XErrorEvent *ev)
+{
+	char buf[1024];
+	XGetErrorText(xdpy, ev->error_code, buf, sizeof(buf));
+	warnx("X error: type=%d, error_code=%d: %s",
+	    ev->type, ev->error_code, buf);
+	return 0;
+}
+
+int
+xevent_poll(Display *xdpy)
+{
+	struct pollfd pfd;
+
+	pfd.fd = ConnectionNumber(xdpy);
+	pfd.events = POLLIN;
+
+	while (!XPending(xdpy)) {
+		if (poll(&pfd, 1, -1) == -1) {
+			if (errno == EINTR) {
+				if (!timed_out)
+					continue;
+				return -1;
+			}
+			warn("poll");
+			return -1;
+		}
+	}
+	return 0;
+}
+
 void
 xtype(json_t *obj)
 {
@@ -818,6 +966,8 @@ xtype(json_t *obj)
 		warnx("can't open display: %s\n", d);
 		return;
 	}
+
+	XSetErrorHandler(x_err_handler);
 
 	if (XStringToKeysym(xtype_hotkey) == 0) {
 		warnx("invalid xtype_hotkey");
@@ -883,6 +1033,8 @@ xtype(json_t *obj)
 	 */
 	XSelectInput(xdpy, root_w, KeyPressMask|KeyReleaseMask);
 	for (;;) {
+		if (xevent_poll(xdpy) == -1)
+			goto exit_wcs;
 		XNextEvent(xdpy, &ev);
 		if (ev.type == KeyPress) {
 			XUngrabKey(xdpy, kc_hot, 0, root_w);
@@ -907,6 +1059,13 @@ xtype(json_t *obj)
 	 * Find two unused keycode to use as scratch space; all keysyms should
 	 * be zero for that keycode, otherwise we find another one.
 	 */
+	// TODO: try to find as many unused keycodes as the length of the
+	// secret, this way we can perform a single keymap change. Some
+	// applications process keymap changes in separate threads and
+	// therefore might hit race conditions between keypress events and
+	// keymap changes, resulting in the wrong keys being sent.
+	// Use each variant in the keycode
+	// Also dedup by character ...create our own keymap, sort of.
 	for (kc_i = min_kc; kc_i < max_kc; kc_i++) {
 		kc_empty = 1;
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++) {
@@ -940,6 +1099,7 @@ xtype(json_t *obj)
 	 * to that character. This way we don't need to bother about what
 	 * modifiers are set.
 	 */
+	// TODO: we'll use modifiers so lock those as well
 	for (wp = wc_secret; *wp != 0; wp++) {
 		if (!iswprint(*wp) || !XKeysymToString(*wp)) {
 			warnx("found non-printable character, "
@@ -959,7 +1119,7 @@ xtype(json_t *obj)
 		XTestFakeKeyEvent(xdpy, kc_scratch, True, CurrentTime);
 		XkbLockGroup(xdpy, XkbUseCoreKbd, saved_kbgroup);
 		XFlush(xdpy);
-		usleep(10000);
+		usleep(30000);
 
 		/* Release. */
 		XkbGetState(xdpy, XkbUseCoreKbd, &kbstate);
@@ -968,7 +1128,7 @@ xtype(json_t *obj)
 		XTestFakeKeyEvent(xdpy, kc_scratch, False, CurrentTime);
 		XkbLockGroup(xdpy, XkbUseCoreKbd, saved_kbgroup);
 		XFlush(xdpy);
-		usleep(80000);
+		usleep(30000);
 
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
 			ks[ks_i] = 0;
@@ -987,10 +1147,9 @@ paste(json_t *obj)
 {
 	json_t      *v;
 	const char **f;
-	FILE        *cmd_fd;
+	int          cmd_fd;
 	const char  *secret;
-	size_t       w;
-	char        *iobuf;
+	ssize_t      w;
 	int          status;
 	char       **cmd_parts;
 	pid_t        child;
@@ -1012,86 +1171,124 @@ paste(json_t *obj)
 			printf("%s: %s\n", *f, json_string_value(v));
 	}
 
-	iobuf = locked_mem(BUFSIZ);
-	if (iobuf == NULL) {
-		warnx("paste");
-		return;
-	}
-
 	if ((cmd_parts = str_split(paste_cmd)) == NULL)
 		errx(1, "str_split");
-	cmd_fd = safe_popen((char *const *)cmd_parts, "w", &child);
-	if (cmd_fd == NULL) {
+	cmd_fd = safe_popen((char *const *)cmd_parts, 1, 1, &child);
+	if (cmd_fd == -1) {
 		warn("cannot paste");
 		free(cmd_parts);
-		wipe_mem(iobuf);
 		return;
 	}
 	free(cmd_parts);
 
-	setbuf(cmd_fd, iobuf);
-
 	v = json_object_get(obj, "secret");
 	if (v == NULL) {
 		warnx("could not get secret");
-		fclose(cmd_fd);
-		wipe_mem(iobuf);
+		close(cmd_fd);
 		return;
 	}
 	if ((secret = json_string_value(v)) == NULL) {
 		warnx("invalid JSON string for secret");
 	} else {
-		w = fwrite(secret, 1, strlen(secret), cmd_fd);
-		if (w < strlen(secret))
+		w = write(cmd_fd, secret, strlen(secret));
+		if (w == -1) {
+			warn("write");
+		} else if (w < strlen(secret))
 			warn("failed to write to paste command; "
-			    "write count: %lu", w);
+			    "write count: %ld", w);
 	}
-
-	fclose(cmd_fd);
+	close(cmd_fd);
 again:
 	if (waitpid(child, &status, 0) == -1) {
-		if (errno == EINTR) {
-			warn("waitpid");
+		if (errno == EINTR && !timed_out)
 			goto again;
-		}
-		err(1, "waitpid");
+		warn("waitpid");
+		return;
 	}
 
-	wipe_mem(iobuf);
-	if (status != 0) {
-		warnx("paste command failed with code %d: '%s'",
-		    status, paste_cmd);
+	if (WIFEXITED(status)) {
+		if (WEXITSTATUS(status) != 0) {
+			warnx("paste command failed with code %d: '%s'",
+			    WEXITSTATUS(status), paste_cmd);
+		}
+	} else {
+		if (WTERMSIG(status) != 2)
+			warnx("paste command exited with signal %d: "
+			    "command='%s'", WTERMSIG(status), paste_cmd);
 	}
 }
 
 int
 confirm(const char *prompt, int dflt)
 {
-	int c;
+	unsigned char  c;
+	struct termios saved_ts, new_ts;
+	ssize_t        r;
+	int            ret = 0;
 
 	printf("%s ", prompt);
 	fflush(stdout);
 
-	for (;;) {
-		c = getchar();
-
-		if (c == '\n')
-			return dflt;
-
-		while (getchar() != '\n');
-
-		switch (c) {
-		case 'y':
-		case 'Y':
+	if (tcgetattr(STDIN_FILENO, &saved_ts) == -1) {
+		/*
+		 * Auto-confirm if we're not on a TTY.
+		 */
+		if (errno == ENOTTY)
 			return 1;
-		case 'n':
-		case 'N':
-			return 0;
-		default:
-			printf("Please answer with 'y' or 'n': ");
-			fflush(stdout);
-		}
+		warn("tcgetattr");
+		return -1;
 	}
+
+	new_ts = saved_ts;
+	new_ts.c_lflag &= ~ICANON;
+	new_ts.c_cc[VMIN] = 1;
+	new_ts.c_cc[VTIME] = 0;
+	if (tcsetattr(STDIN_FILENO, TCSANOW, &new_ts) == -1) {
+		warn("tcsetattr");
+		return -1;
+	}
+again:
+	if ((r = read(0, &c, 1)) == -1) {
+		if (errno == EINTR && !timed_out)
+			goto again;
+		warn("read");
+		ret = -1;
+		goto end;
+	}
+	if (r == 0) {
+		warnx("read EOF");
+		ret = -1;
+		goto end;
+	}
+
+	switch (c) {
+	case 'y':
+	case 'Y':
+		ret = 1;
+		printf("\n");
+		break;
+	case 'n':
+	case 'N':
+		ret = 0;
+		printf("\n");
+		break;
+	case '\n':
+		ret = dflt;
+		break;
+	default:
+		printf("\nPlease answer with 'y' or 'n': ");
+		fflush(stdout);
+		goto again;
+	}
+end:
+	if (tcsetattr(STDIN_FILENO, TCSANOW, &saved_ts) == -1) {
+		warn("tcsetattr");
+		ret = -1;
+	}
+
+	if (ret != -1)
+		reset_timer();
+	return ret;
 }
 
 char *
@@ -1099,12 +1296,13 @@ read_field(const char *name, int echo)
 {
 	char           *input;
 	struct termios  saved_ts, new_ts;
+	ssize_t         r;
 
 	printf("%s: ", name);
 	fflush(stdout);
 
 	if (!echo) {
-		if (tcgetattr(0, &saved_ts) == -1) {
+		if (tcgetattr(STDIN_FILENO, &saved_ts) == -1) {
 			warn("cannot get terminal settings");
 			return NULL;
 		}
@@ -1118,10 +1316,10 @@ read_field(const char *name, int echo)
 		}
 	}
 
-	input = locked_mem(max_value_length);
+	input = locked_mem(max_value_length + 1);
 	if (input == NULL) {
 		warn("could not read field");
-		return NULL;
+		goto end;
 	}
 
 	// TODO: eventually get rid of this by looping until we get to
@@ -1129,12 +1327,34 @@ read_field(const char *name, int echo)
 	// until we can fit it all. We'd still need a max_value_len, but it
 	// could be much larger. And it paves the way to arbitrary secrets
 	// like keys in base64.
-	if (fgets(input, max_value_length + 1, stdin) == NULL) {
-		warn("fgets");
+again:
+	r = read(0, input, max_value_length + 1);
+	if (r == -1) {
+		if (errno == EINTR && !timed_out)
+			goto again;
+		warn("read");
 		wipe_mem(input);
-		return NULL;
+		input = NULL;
+		goto end;
 	}
-
+	if (r == 0) {
+		warnx("read EOF");
+		wipe_mem(input);
+		input = NULL;
+		goto end;
+	}
+	if ((r == max_value_length + 1) && input[r - 1] != '\n') {
+		warnx("value too long");
+		wipe_mem(input);
+		input = NULL;
+		goto end;
+	}
+	/* Squash the newline */
+	if (input[r - 1] == '\n')
+		input[r - 1] = '\0';
+	else
+		input[r] = '\0';
+end:
 	if (!echo) {
 		if (tcsetattr(0, TCSANOW, &saved_ts) == -1) {
 			warn("cannot reset terminal settings");
@@ -1144,7 +1364,6 @@ read_field(const char *name, int echo)
 		printf("\n");
 	}
 
-	input[strlen(input) - 1] = '\0';
 	return input;
 }
 
@@ -1156,38 +1375,49 @@ add_secret(const char *key, int overwrite)
 	const char **f;
 
 	if (find_secret(key) && !overwrite) {
-		warnx("secret already exists\n");
-		return 0;
+		warnx("secret already exists");
+		return -1;
 	}
 
-	s = json_object();
+	if ((s = json_object()) == NULL) {
+		warnx("json_object() failed");
+		return -1;
+	}
+
 	if (overwrite) {
 		old = json_object_get(get_secrets(), key);
 		if (old == NULL) {
-			warnx("couldn't get secret %s\n", key);
-			return 0;
+			warnx("couldn't get secret %s", key);
+			goto fail;
 		}
 		if (json_object_update(s, old) == -1) {
 			warnx("failed to update temporary JSON object");
-			return 0;
+			goto fail;
 		}
 	}
 
 	for (f = fields; *f; f++) {
 		if (overwrite) {
 			printf("Change %s ? [y/N]", *f);
-			if (!confirm("", 0))
+			switch (confirm("", 0)) {
+			case 0:
 				continue;
+			case -1:
+				goto fail;
+			default:
+				/* Proceed */
+				break;
+			}
 		}
 		if (strcmp(*f, "secret") == 0) {
 			for (;;) {
 				if ((input = read_field("secret", 0)) == NULL)
-					return 0;
+					goto fail;
 
 				if ((input2 = read_field("confirm secret", 0))
 				    == NULL) {
 					wipe_mem(input);
-					return 0;
+					goto fail;
 				}
 
 				if (strcmp(input, input2) == 0) {
@@ -1200,17 +1430,18 @@ add_secret(const char *key, int overwrite)
 			}
 		} else {
 			if ((input = read_field(*f, 1)) == NULL)
-				return 0;
+				goto fail;
 		}
 
 		if (json_object_set_new(s, *f, json_string(input)) == -1) {
 			warnx("failed to add field %s to temporary "
 			    "JSON object", *f);
 			wipe_mem(input);
-			return 0;
+			goto fail;
 		}
 
 		wipe_mem(input);
+		reset_timer();
 	}
 
 	if (overwrite) {
@@ -1222,18 +1453,26 @@ add_secret(const char *key, int overwrite)
 
 	show_secret(s, 1);
 
-	if (!confirm("[Y/n]:", 1))
+	switch (confirm("[Y/n]:", 1)) {
+	case -1:
+		goto fail;
+	case 0:
+		json_decref(s);
 		return 0;
+	default:
+		/* Proceed */
+		break;
+	}
 
 	if (overwrite) {
 		if (json_object_update(old, s) == -1) {
 			warnx("failed to overwrite current entry");
-			return 0;
+			goto fail;
 		}
 	} else {
 		if (json_object_set_new(get_secrets(), key, s) == -1) {
 			warnx("failed to add new entry");
-			return 0;
+			goto fail;
 		}
 	}
 
@@ -1243,6 +1482,9 @@ add_secret(const char *key, int overwrite)
 		printf("Added %s\n", key);
 
 	return 1;
+fail:
+	json_decref(s);
+	return -1;
 }
 
 int
@@ -1251,8 +1493,15 @@ delete_secret(const char *key)
 	if (key == NULL)
 		return 0;
 
-	if (!confirm("Are you sure [y/N]:", 0))
+	switch (confirm("Are you sure [y/N]:", 0)) {
+	case -1:
+		return -1;
+	case 0:
 		return 0;
+	default:
+		/* Proceed */
+		break;
+	}
 
 	if (json_object_del(get_secrets(), key) == -1) {
 		warnx("failed to delete key");
@@ -1306,35 +1555,21 @@ rename_secret(const char *old_key)
 }
 
 void
-reset_timer()
+sigalrm_handler(int sig)
 {
-	struct itimerval exit_timer;
-
-	memset(&exit_timer, 0, sizeof(exit_timer));
-	exit_timer.it_value.tv_sec = timeout;
-
-	if (setitimer(ITIMER_REAL, &exit_timer, NULL) == -1) {
-		warn("setitimer");
-		return;
-	}
-
-	if (debug_level)
-		warnx("timer set to exit in %lu seconds",
-			exit_timer.it_value.tv_sec);
-}
-
-void
-sig_handler(int sig)
-{
-	if (sig == SIGALRM)
-		warnx("timeout reached");
+	timed_out = 1;
 	killpg(0, 15);
-	clear_db();
-	exit(0);
+	if (in_readline) {
+		rl_free_line_state();
+		rl_cleanup_after_signal();
+		write(STDERR_FILENO, "timed out\n", 10);
+		restore_termios();
+		_exit(1);
+	}
 }
 
 void
-sig_int()
+sig_int(int unused)
 {
 	/*
 	 * Child processes will reset the handler on execve(),
@@ -1349,9 +1584,9 @@ secrets_list_generator(const char *pattern, int state)
 	char               *k;
 	static const char **key, **keys;
 
-
 	if (!state) {
-		load_db();
+		if (!load_db())
+			return NULL;
 		keys = get_secret_names(pattern);
 		key = keys;
 	}
@@ -1381,30 +1616,29 @@ secrets_completion(const char *pattern, int start, int end)
 int
 main(int argc, char **argv)
 {
-	int   opt;
-	char *line = NULL;
-	char *token;
-	int   quit = 0;
-	char  prompt[sizeof(program_name) + 2];
-
-	struct sigaction act;
-
-	struct rlimit no_core = {0, 0};
+	int               opt;
+	char             *line = NULL;
+	char             *token;
+	int               quit = 0;
+	char              prompt[sizeof(program_name) + 2];
+	struct sigaction  act;
+	struct rlimit     no_core = {0, 0};
+	struct termios    ts;
 
 	snprintf(prompt, sizeof(prompt), "%s> ", program_name);
 
-	sigemptyset(&act.sa_mask);
-	sigaddset(&act.sa_mask, SIGINT);
-	sigaddset(&act.sa_mask, SIGTERM);
-	sigaddset(&act.sa_mask, SIGALRM);
-	act.sa_flags = 0;
-	act.sa_handler = sig_handler;
-	if (sigaction(SIGALRM, &act, NULL) == -1
-	    || sigaction(SIGTERM, &act, NULL) == -1)
-		err(1, "sigaction");
-
+	bzero(&act, sizeof(act));
 	act.sa_handler = sig_int;
 	if (sigaction(SIGINT, &act, NULL) == -1)
+		err(1, "sigaction");
+
+	/*
+	 * We don't want the TERM signal to come in and terminate the
+	 * program before we do any cleanup.
+	 */
+	bzero(&act, sizeof(act));
+	act.sa_handler = SIG_IGN;
+	if (sigaction(SIGTERM, &act, NULL) == -1)
 		err(1, "sigaction");
 
 	while ((opt = getopt(argc, argv, "Xxdvhc:")) != -1) {
@@ -1461,7 +1695,20 @@ main(int argc, char **argv)
 
 	read_cfg();
 
-	reset_timer();
+	/*
+	 * Save our terminal settings so we can restore at exit.
+	 */
+	if (tcgetattr(STDIN_FILENO, &saved_termios) == -1)
+		err(1, "tcgetattr");
+
+	ts = saved_termios;
+	ts.c_iflag |= ICRNL;
+	ts.c_oflag |= OPOST | ONLCR;
+	ts.c_lflag |= ICANON | ECHO | ISIG | IEXTEN;
+	if (tcsetattr(STDIN_FILENO, TCSANOW, &ts) == -1)
+		err(1, "tcsetattr");
+
+	atexit(restore_termios);
 
 	warnx("timeout set to %d seconds", timeout);
 
@@ -1470,12 +1717,27 @@ main(int argc, char **argv)
 			warn("could not disable core dumps; setrlimit");
 	}
 
+	umask(077);
+
 	json_set_alloc_funcs(locked_mem, wipe_mem);
 
 	rl_attempted_completion_function = secrets_completion;
 
-	while (!quit) {
+	bzero(&act, sizeof(act));
+	sigemptyset(&act.sa_mask);
+	sigaddset(&act.sa_mask, SIGINT);
+	sigaddset(&act.sa_mask, SIGTERM);
+	sigaddset(&act.sa_mask, SIGALRM);
+	act.sa_flags = 0;
+	act.sa_handler = sigalrm_handler;
+	if (sigaction(SIGALRM, &act, NULL) == -1)
+		err(1, "sigaction");
+
+	while (!quit && !timed_out) {
+		reset_timer();
+		in_readline = 1;
 		line = readline(prompt);
+		in_readline = 0;
 		reset_timer();
 		if (line == NULL)
 			break;
@@ -1493,8 +1755,9 @@ main(int argc, char **argv)
 				printf("Usage: add [secret name]\n");
 				goto again;
 			}
-			load_db();
-			if (add_secret(token, 0))
+			if (!load_db())
+				goto again;
+			if (add_secret(token, 0) == 1)
 				save_db();
 			clear_db();
 		} else if (strcmp(token, "change") == 0) {
@@ -1503,8 +1766,9 @@ main(int argc, char **argv)
 				printf("Usage: change [secret name]\n");
 				goto again;
 			}
-			load_db();
-			if (add_secret(token, 1))
+			if (!load_db())
+				goto again;
+			if (add_secret(token, 1) == 1)
 				save_db();
 			clear_db();
 		} else if (strcmp(token, "delete") == 0) {
@@ -1513,8 +1777,9 @@ main(int argc, char **argv)
 				printf("Usage: delete [secret name]\n");
 				goto again;
 			}
-			load_db();
-			if (delete_secret(token))
+			if (!load_db())
+				goto again;
+			if (delete_secret(token) == 1)
 				save_db();
 			clear_db();
 		} else if (strcmp(token, "help") == 0) {
@@ -1522,21 +1787,20 @@ main(int argc, char **argv)
 			    "rename, save, quit, show, showall, xtype\n");
 		} else if (strcmp(token, "list") == 0) {
 			token = strtok(NULL, " ");
-			load_db();
+			if (!load_db())
+				goto again;
 			list_secrets(token);
 			clear_db();
 		} else if (strcmp(token, "xtype") == 0) {
 			token = strtok(NULL, " ");
-			if (token == NULL)
+			if (token == NULL || !load_db())
 				goto again;
-			load_db();
 			xtype(find_secret(token));
 			clear_db();
 		} else if (strcmp(token, "paste") == 0) {
 			token = strtok(NULL, " ");
-			if (token == NULL)
+			if (token == NULL || !load_db())
 				goto again;
-			load_db();
 			paste(find_secret(token));
 			clear_db();
 		} else if (strcmp(token, "rename") == 0) {
@@ -1545,28 +1809,28 @@ main(int argc, char **argv)
 				printf("Usage: rename [secret name]\n");
 				goto again;
 			}
-			load_db();
+			if (!load_db())
+				goto again;
 			if (rename_secret(token))
 				save_db();
 			clear_db();
 		} else if (strcmp(token, "save") == 0) {
-			load_db();
+			if (!load_db())
+				goto again;
 			save_db();
 			clear_db();
 		} else if (strcmp(token, "quit") == 0) {
 			quit = 1;
 		} else if (strcmp(token, "showall") == 0) {
 			token = strtok(NULL, " ");
-			if (token == NULL)
+			if (token == NULL || !load_db())
 				goto again;
-			load_db();
 			show_secret(find_secret(token), 0);
 			clear_db();
 		} else if (strcmp(token, "show") == 0) {
 			token = strtok(NULL, " ");
-			if (token == NULL)
+			if (token == NULL || !load_db())
 				goto again;
-			load_db();
 			show_secret(find_secret(token), 1);
 			clear_db();
 		} else {
@@ -1574,6 +1838,12 @@ main(int argc, char **argv)
 		}
 again:
 		free(line);
+	}
+	clear_history();
+
+	if (timed_out) {
+		warnx("timeout reached");
+		return 1;
 	}
 
 	printf("Bye.\n");
