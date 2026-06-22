@@ -43,7 +43,6 @@
 #include <wctype.h>
 #include <locale.h>
 
-#include <X11/XKBlib.h>
 #include <X11/Xlib.h>
 #include <X11/Xutil.h>
 #include <X11/extensions/XTest.h>
@@ -74,6 +73,16 @@ volatile sig_atomic_t timed_out = 0;
 volatile sig_atomic_t in_readline = 0;
 
 const char *fields[] = { "notes", "url", "login", "secret", NULL };
+
+/* No valid X keycode is 0 (they run 8..255), so we use it to mean "none". */
+#define NO_KC 0
+
+struct keymap_ent {
+	wchar_t wc;     /* the character, as decoded by mbstowcs() */
+	KeySym  ks;     /* the keysym we want it to mean */
+	int     kc;     /* scratch keycode, or NO_KC if it uses the fallback */
+	int     n;      /* occurrences of wc in the secret */
+};
 
 void save_db();
 
@@ -925,26 +934,68 @@ xevent_poll(Display *xdpy)
 	return 0;
 }
 
+/*
+ * Map a decoded character to the X keysym that means it. X11 convention
+ * (keysymdef.h / X protocol Appendix A): code points in the Latin-1 range
+ * U+0000..U+00FF are their own keysym; everything else is the Unicode code
+ * point with the 0x01000000 "Unicode keysym" flag set.
+ */
+static KeySym
+wchar_to_keysym(wchar_t wc)
+{
+	if ((unsigned long)wc <= 0x00ff)
+		return (KeySym)wc;
+	return (KeySym)wc | 0x01000000UL;
+}
+
+/* Sort keymap_ent's by occurrence count, most frequent first. */
+static int
+by_freq_desc(const void *a, const void *b)
+{
+	const struct keymap_ent *ea = a;
+	const struct keymap_ent *eb = b;
+
+	return eb->n - ea->n;
+}
+
+/*
+ * Fake a press and release of a keycode. Every group and level of our scratch
+ * keycodes holds the same keysym, so the active keyboard group is irrelevant
+ * and we don't need to pin it.
+ */
+static void
+fake_tap(Display *xdpy, int kc)
+{
+	XTestFakeKeyEvent(xdpy, kc, True, CurrentTime);
+	XFlush(xdpy);
+	usleep(30000);
+
+	XTestFakeKeyEvent(xdpy, kc, False, CurrentTime);
+	XFlush(xdpy);
+	usleep(30000);
+}
+
 void
 xtype(json_t *obj)
 {
-	json_t      *v;
-	const char **f;
-	const char  *secret;
-	wchar_t     *wc_secret = NULL, *wp;
-	size_t       wc_secret_len;
+	json_t             *v;
+	const char        **f;
+	const char         *secret;
+	wchar_t            *wc_secret = NULL, *wp;
+	size_t              wc_secret_len;
 
-	Display     *xdpy;
-	const char  *d = getenv("DISPLAY");
-	int          min_kc, max_kc, ks_per_kc;
-	int          k, kc_i, ks_i, kc_empty;
-	int          kc_scratch;
-	int          kc_hot, kc_esc, ign_mod;
-	KeySym      *keysyms, *ks = NULL;
-	XEvent       ev;
-	Window       root_w;
-	XkbStateRec  kbstate;
-	int          saved_kbgroup;
+	Display            *xdpy;
+	const char         *d = getenv("DISPLAY");
+	int                 min_kc, max_kc, ks_per_kc;
+	int                 k, kc_i, ks_i, kc_empty;
+	int                 kc_hot, kc_esc, ign_mod;
+	struct keymap_ent  *map = NULL;
+	int                 map_len, i;
+	int                 nfree, npermanent, fallback_kc, need_fallback;
+	int                 free_kc[256]; /* keycodes are CARD8: 8..255 */
+	KeySym             *keysyms, *ks = NULL;
+	XEvent              ev;
+	Window              root_w;
 
 	if (obj == NULL) {
 		printf("secret not found\n");
@@ -1007,8 +1058,6 @@ xtype(json_t *obj)
 
 	printf("** Press %s to send keys, or %s to abort\n",
 	    xtype_hotkey, xtype_esc);
-	printf("** NOTE: this has not been well tested with non-ASCII "
-	    "characters.\n");
 
 	/*
 	 * Grab secret-typing hotkey and ESC at the root.
@@ -1050,23 +1099,76 @@ xtype(json_t *obj)
 	XSelectInput(xdpy, root_w, 0);
 	XSync(xdpy, False);
 
-	/* Get a list of all keysyms for the current keyboard map */
+	/* Snapshot the current keymap so we can find empty slots. */
 	XDisplayKeycodes(xdpy, &min_kc, &max_kc);
 	keysyms = XGetKeyboardMapping(xdpy, min_kc, max_kc - min_kc + 1,
 	    &ks_per_kc);
+	if (keysyms == NULL) {
+		warnx("XGetKeyboardMapping failed");
+		goto exit_wcs;
+	}
 
 	/*
-	 * Find two unused keycode to use as scratch space; all keysyms should
-	 * be zero for that keycode, otherwise we find another one.
+	 * Build a table of the UNIQUE characters in the secret. wc_secret_len
+	 * is an upper bound on the number of uniques, so size to that. Each
+	 * wchar_t is a single scalar here (mbstowcs already did the decoding),
+	 * so "duplicate" is just ==.
 	 */
-	// TODO: try to find as many unused keycodes as the length of the
-	// secret, this way we can perform a single keymap change. Some
-	// applications process keymap changes in separate threads and
-	// therefore might hit race conditions between keypress events and
-	// keymap changes, resulting in the wrong keys being sent.
-	// Use each variant in the keycode
-	// Also dedup by character ...create our own keymap, sort of.
-	for (kc_i = min_kc; kc_i < max_kc; kc_i++) {
+	map = locked_mem(sizeof(*map) * wc_secret_len);
+	if (map == NULL) {
+		warn("locked_mem");
+		goto exit_keysyms;
+	}
+	map_len = 0;
+	for (wp = wc_secret; *wp != 0; wp++) {
+		KeySym ks_want;
+		int    j, dup;
+
+		if (!iswprint(*wp)) {
+			warnx("skipping non-printable character");
+			continue;
+		}
+		ks_want = wchar_to_keysym(*wp);
+		if (XKeysymToString(ks_want) == NULL) {
+			warnx("no keysym for character; skipping");
+			continue;
+		}
+
+		dup = 0;
+		for (j = 0; j < map_len; j++) {
+			if (map[j].wc == *wp) {
+				map[j].n++;
+				dup = 1;
+				break;
+			}
+		}
+		if (dup)
+			continue;
+
+		map[map_len].wc = *wp;
+		map[map_len].ks = ks_want;
+		map[map_len].kc = NO_KC;
+		map[map_len].n = 1;
+		map_len++;
+	}
+	if (map_len == 0) {
+		warnx("nothing typeable in secret");
+		goto exit_map;
+	}
+
+	/*
+	 * Rank the unique characters by how often they occur, so the ones we
+	 * type most get the scarce permanent scratch keycodes.
+	 */
+	qsort(map, map_len, sizeof(*map), by_freq_desc);
+
+	/*
+	 * Collect the empty keycodes. A keycode is empty when every keysym
+	 * level is 0, i.e. no real key produces anything through it, so
+	 * reprogramming it can't clobber the user's keyboard.
+	 */
+	nfree = 0;
+	for (kc_i = min_kc; kc_i <= max_kc; kc_i++) {
 		kc_empty = 1;
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++) {
 			k = (kc_i - min_kc) * ks_per_kc + ks_i;
@@ -1076,66 +1178,88 @@ xtype(json_t *obj)
 			}
 		}
 		if (kc_empty)
-			break;
+			free_kc[nfree++] = kc_i;
 	}
-	XFree(keysyms);
-
-	if (kc_i == max_kc) {
-		warnx("no empty keycode; cannot xtype");
-		goto exit_wcs;
-	}
-	kc_scratch = kc_i;
-
-	/* Create our fake keysyms for this keycode */
-	ks = locked_mem(sizeof(KeySym) * ks_per_kc);
-	if (ks == NULL) {
-		warn("malloc");
-		goto exit_wcs;
+	if (nfree == 0) {
+		warnx("no empty keycodes; cannot xtype");
+		goto exit_map;
 	}
 
 	/*
-	 * For each character in our secret, change the current keyboard
-	 * mapping so that our scratch keycode gets all its keysyms set
-	 * to that character. This way we don't need to bother about what
-	 * modifiers are set.
+	 * With at least as many empty keycodes as unique characters, every
+	 * character gets its own permanent slot and we never remap mid-send.
+	 * Otherwise reserve one slot as a rotating fallback and give permanent
+	 * slots to the (nfree - 1) most frequent characters; the rest borrow
+	 * the fallback slot one keystroke at a time. Entries past npermanent
+	 * keep kc == NO_KC from the table build, marking them as fallback users.
 	 */
-	// TODO: we'll use modifiers so lock those as well
-	for (wp = wc_secret; *wp != 0; wp++) {
-		if (!iswprint(*wp) || !XKeysymToString(*wp)) {
-			warnx("found non-printable character, "
-			    "or XKeysymToString() failed");
-			continue;
-		}
+	need_fallback = nfree < map_len;
+	npermanent = need_fallback ? nfree - 1 : map_len;
+	for (i = 0; i < npermanent; i++)
+		map[i].kc = free_kc[i];
+	fallback_kc = need_fallback ? free_kc[npermanent] : NO_KC;
 
-		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
-			ks[ks_i] = *wp;
-		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
-		XSync(xdpy, False);
-
-		/* Press ... */
-		XkbGetState(xdpy, XkbUseCoreKbd, &kbstate);
-		saved_kbgroup = kbstate.group;
-		XkbLockGroup(xdpy, XkbUseCoreKbd, 0);
-		XTestFakeKeyEvent(xdpy, kc_scratch, True, CurrentTime);
-		XkbLockGroup(xdpy, XkbUseCoreKbd, saved_kbgroup);
-		XFlush(xdpy);
-		usleep(30000);
-
-		/* Release. */
-		XkbGetState(xdpy, XkbUseCoreKbd, &kbstate);
-		saved_kbgroup = kbstate.group;
-		XkbLockGroup(xdpy, XkbUseCoreKbd, 0);
-		XTestFakeKeyEvent(xdpy, kc_scratch, False, CurrentTime);
-		XkbLockGroup(xdpy, XkbUseCoreKbd, saved_kbgroup);
-		XFlush(xdpy);
-		usleep(30000);
-
-		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
-			ks[ks_i] = 0;
-		XChangeKeyboardMapping(xdpy, kc_scratch, ks_per_kc, ks, 1);
-		XSync(xdpy, False);
+	/*
+	 * Program the permanent slots up front, with every group and level set
+	 * to the same keysym so the active group and modifiers are irrelevant.
+	 * Then sync once: apps that process keymap changes asynchronously can't
+	 * race those remaps against a keypress, since nothing touches a
+	 * permanent slot again until we're done.
+	 */
+	ks = locked_mem(sizeof(KeySym) * ks_per_kc);
+	if (ks == NULL) {
+		warn("locked_mem");
+		goto exit_map;
 	}
+	for (i = 0; i < map_len; i++) {
+		if (map[i].kc == NO_KC)
+			continue;
+		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
+			ks[ks_i] = map[i].ks;
+		XChangeKeyboardMapping(xdpy, map[i].kc, ks_per_kc, ks, 1);
+	}
+	XSync(xdpy, False);
+
+	/*
+	 * Play the secret. A character with a permanent slot is just a tap; an
+	 * overflow character (kc == NO_KC) borrows the fallback slot, which is the
+	 * one remaining per-keystroke remap. The server resolves keycode ->
+	 * keysym -> char via the map, so the app receives map[i].wc.
+	 */
+	for (wp = wc_secret; *wp != 0; wp++) {
+		for (i = 0; i < map_len; i++)
+			if (map[i].wc == *wp)
+				break;
+		if (i == map_len)
+			continue; /* skipped during table build */
+
+		if (map[i].kc != NO_KC)
+			fake_tap(xdpy, map[i].kc);
+		else {
+			for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
+				ks[ks_i] = map[i].ks;
+			XChangeKeyboardMapping(xdpy, fallback_kc, ks_per_kc,
+			    ks, 1);
+			XSync(xdpy, False);
+			fake_tap(xdpy, fallback_kc);
+		}
+	}
+
+	/* Undo every scratch keycode we touched. */
+	for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
+		ks[ks_i] = 0;
+	for (i = 0; i < map_len; i++)
+		if (map[i].kc != NO_KC)
+			XChangeKeyboardMapping(xdpy, map[i].kc, ks_per_kc, ks, 1);
+	if (fallback_kc != NO_KC)
+		XChangeKeyboardMapping(xdpy, fallback_kc, ks_per_kc, ks, 1);
+	XSync(xdpy, False);
+
 	wipe_mem(ks);
+exit_map:
+	wipe_mem(map);
+exit_keysyms:
+	XFree(keysyms);
 exit_wcs:
 	wipe_mem(wc_secret);
 exit_display:

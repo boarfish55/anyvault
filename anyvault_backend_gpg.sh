@@ -18,7 +18,7 @@
 # along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 PATH=/bin:/usr/bin
-db=/home/plalonde/prog/anyvault/anyvault.json.sample.gpg
+db=/srv/prog/anyvault/anyvault.json.sample.gpg
 
 usage() {
 	echo "Usage: $(basename $0) -h <command>"
@@ -75,12 +75,22 @@ decrypt() {
 	exec /usr/bin/gpg --decrypt $db
 }
 
+backup() {
+	if [ ! -r $db ]; then
+		exit 0
+	fi
+	exec /bin/cp $db ${db}~
+}
+
 case $1 in
 	encrypt)
 		encrypt
 		;;
 	decrypt)
 		decrypt
+		;;
+	backup)
+		backup
 		;;
 	*)
 		usage

@@ -12,16 +12,16 @@
 # If using GnuPG, not that you may need to set the GPG_TTY environment
 # variable if running from a terminal.
 #
-encrypt_cmd: /home/plalonde/prog/anyvault/anyvault_backend_gpg.sh encrypt
+encrypt_cmd: /srv/prog/anyvault/anyvault_backend_gpg.sh encrypt
 
 # Decryption command. The command must write the decrypted output to STDOUT.
 # It is recommended that the decryption command also verifies signatures on
 # the database to ensure we are not dealing with a fake.
-decrypt_cmd: /home/plalonde/prog/anyvault/anyvault_backend_gpg.sh decrypt
+decrypt_cmd: /srv/prog/anyvault/anyvault_backend_gpg.sh decrypt
 
 # After a successful database save (and only once per session), we perform
 # a backup using the following command.
-backup_cmd: /bin/cp /home/plalonde/prog/anyvault/anyvault.json.sample.gpg /home/plalonde/prog/anyvault/anyvault.json.sample.gpg~
+backup_cmd: /srv/prog/anyvault/anyvault_backend_gpg.sh backup
 
 # Command to paste secrets to the clipboard. The command has to read the
 # secret from STDIN. Ideally, it should not keep the secret forever.
