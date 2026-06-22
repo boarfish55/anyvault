@@ -109,11 +109,15 @@ mechanisms are exposed.
 .Pp
 The
 .Cm xtype
-command rewrites a scratch keycode in the global X keyboard map for
-each character it sends, then zeroes it. A local X client polling
+command maps each distinct character of the secret to a keycode in the
+global X keyboard map, injects the keystrokes, then restores the
+original map. It uses unused keycodes first, borrowing ordinary keys
+only when the secret has more distinct characters than there are spare
+keycodes. While it is typing, the secret's distinct characters are
+present in the keyboard map, so a local X client polling
 .Xr XGetKeyboardMapping 3
-in a tight loop can reconstruct the secret. Exposure is transient (a
-few milliseconds per character) and does not persist on disk.
+can read the character set. Exposure is transient and does not persist
+on disk.
 .Pp
 The
 .Cm paste
@@ -184,9 +188,24 @@ workaround; use the
 .Cm paste
 command in those cases instead.
 .Pp
+While
 .Cm xtype
-may also occasionally emit a wrong sequence of characters in
-applications that process keyboard-mapping changes and key events on
-separate threads, producing duplicated or skipped characters.
+is running it temporarily modifies the global X keyboard map and
+restores it when done, including when interrupted by an ordinary
+terminating signal such as
+.Dv SIGTERM
+or
+.Dv SIGINT .
+It cannot recover from
+.Dv SIGKILL
+or a fatal fault such as
+.Dv SIGSEGV ,
+so a forced kill
+.Pq Ql kill -9
+or a crash while it is typing will leave its borrowed keycodes remapped,
+and some keys will then produce the wrong characters. Recover by
+reloading the keyboard map, for example with
+.Xr setxkbmap 1 ,
+or by logging out and back in.
 .Sh AUTHORS
 .An Pascal Lalonde <plalonde@overnet.ca>

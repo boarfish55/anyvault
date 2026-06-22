@@ -63,6 +63,7 @@ char   *backup_cmd = NULL;
 char   *paste_cmd = NULL;
 char   *xtype_hotkey = "F11";
 char   *xtype_esc = "Escape";
+int     xtype_delay_ms = 30; /* pause after each fake key event, milliseconds */
 
 int     db_backup_done = 0;
 json_t *db = NULL;
@@ -76,17 +77,8 @@ const char *fields[] = { "notes", "url", "login", "secret", NULL };
 
 int x_error = 0;
 
-/*
- * Restore context: while xtype() has the live keymap modified, this holds
- * enough to put it back, so a crash or terminating signal doesn't leave the
- * user's borrowed keys clobbered. Armed only across the modify/type/restore
- * window.
- */
-static Display               *xrc_xdpy;
-static KeySym                *xrc_keysyms;
-static int                    xrc_min_kc, xrc_ks_per_kc, xrc_n;
-static int                    xrc_kc[256];
-static volatile sig_atomic_t  xrc_armed;
+/* Set by the xtype() signal handler so the typing loop can stop and restore. */
+static volatile sig_atomic_t xtype_interrupted;
 
 struct keymap_ent {
 	wchar_t wc;  /* the character, as decoded by mbstowcs() */
@@ -611,6 +603,12 @@ read_cfg()
 			xtype_esc = strdup(v);
 			if (xtype_esc == NULL)
 				err(1, "could not load xtype_esc");
+		} else if (strcmp(p, "xtype_delay") == 0) {
+			if (atoi(v) < 0 || atoi(v) > 1000)
+				warnx("invalid xtype_delay specified; "
+				    "must be 0-1000 (ms)");
+			else
+				xtype_delay_ms = atoi(v);
 		} else if (strcmp(p, "timeout") == 0) {
 			if (atoi(v) < 0)
 				warnx("invalid timeout specified");
@@ -1004,40 +1002,23 @@ fake_tap(Display *xdpy, int kc)
 {
 	XTestFakeKeyEvent(xdpy, kc, True, CurrentTime);
 	XFlush(xdpy);
-	usleep(30000);
+	usleep(xtype_delay_ms * 1000);
 
 	XTestFakeKeyEvent(xdpy, kc, False, CurrentTime);
 	XFlush(xdpy);
-	usleep(30000);
+	usleep(xtype_delay_ms * 1000);
 }
 
 /*
- * Put every touched keycode back to its snapshot symbols. Idempotent. Also
- * called from the signal handler below: that path isn't strictly async-signal
- * safe (Xlib takes locks), but it's a best-effort last resort before we die
- * with a clobbered keymap, and the typing loop spends almost all its time in
- * usleep() rather than inside Xlib.
+ * Async-signal-safe handler: it only records the signal. Restoring the keymap
+ * means talking to Xlib, which is not safe from a handler -- a signal can
+ * arrive mid-request and reentering Xlib corrupts the connection. So the
+ * typing loop checks this flag and does the restore from normal context.
  */
 static void
-xtype_restore(void)
+xtype_sig(int sig)
 {
-	int i;
-
-	if (!xrc_armed)
-		return;
-	xrc_armed = 0;
-	for (i = 0; i < xrc_n; i++)
-		XChangeKeyboardMapping(xrc_xdpy, xrc_kc[i], xrc_ks_per_kc,
-		    &xrc_keysyms[(xrc_kc[i] - xrc_min_kc) * xrc_ks_per_kc], 1);
-	XFlush(xrc_xdpy);
-}
-
-static void
-xtype_sig_restore(int sig)
-{
-	xtype_restore();
-	signal(sig, SIG_DFL);
-	raise(sig);
+	xtype_interrupted = sig;
 }
 
 void
@@ -1061,9 +1042,9 @@ xtype(json_t *obj)
 	KeySym             *keysyms, *ks = NULL;
 	XEvent              ev;
 	Window              root_w;
-	struct sigaction    rsa, rold[6];
-	int                 rsig[] = { SIGHUP, SIGQUIT, SIGSEGV,
-	                        SIGBUS, SIGABRT, SIGFPE };
+	struct sigaction    rsa, rold[5];
+	int                 rsig[] = { SIGHUP, SIGINT, SIGTERM,
+	                        SIGQUIT, SIGABRT };
 	int                 ri, nrsig = sizeof(rsig) / sizeof(*rsig);
 
 	if (obj == NULL) {
@@ -1278,23 +1259,19 @@ xtype(json_t *obj)
 	}
 
 	/*
-	 * Arm the restore context and catch terminating signals before we touch
-	 * the live keymap, so a crash or kill mid-type still puts the borrowed
-	 * keys back. Every path out from here goes through the exit_restore label,
-	 * so the keymap is always put back and the handlers always dropped.
+	 * Catch terminating signals before we touch the live keymap, so a kill
+	 * mid-type doesn't leave the borrowed keys remapped. The handler only sets
+	 * a flag; the typing loop notices it and bails through exit_restore, which
+	 * always restores the keymap and drops the handlers. We deliberately don't
+	 * catch synchronous faults (SIGSEGV, etc.): returning from those re-faults,
+	 * and restoring from such a handler isn't safe -- a genuine crash, like
+	 * SIGKILL, may leave the keymap modified.
 	 */
-	xrc_xdpy = xdpy;
-	xrc_keysyms = keysyms;
-	xrc_min_kc = min_kc;
-	xrc_ks_per_kc = ks_per_kc;
-	xrc_n = map_len;
-	for (i = 0; i < map_len; i++)
-		xrc_kc[i] = map[i].kc;
+	xtype_interrupted = 0;
 	bzero(&rsa, sizeof(rsa));
-	rsa.sa_handler = xtype_sig_restore;
+	rsa.sa_handler = xtype_sig;
 	for (ri = 0; ri < nrsig; ri++)
 		sigaction(rsig[ri], &rsa, &rold[ri]);
-	xrc_armed = 1;
 
 	for (i = 0; i < map_len; i++) {
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
@@ -1314,7 +1291,7 @@ xtype(json_t *obj)
 	 * map[i].wc.
 	 */
 	for (wp = wc_secret; *wp != 0; wp++) {
-		if (timed_out)
+		if (timed_out || xtype_interrupted)
 			break;
 
 		for (i = 0; i < map_len; i++)
@@ -1328,15 +1305,21 @@ xtype(json_t *obj)
 
 	/*
 	 * Restore every keycode we touched to its original symbols (empty rows
-	 * were all-zero, so those clear; borrowed real keys come back), then
-	 * disarm and drop the signal handlers we installed. Reached by fall-through
-	 * on the normal path and by goto when we bail after arming.
+	 * were all-zero, so those clear; borrowed real keys come back), then drop
+	 * the signal handlers we installed. Reached by fall-through on the normal
+	 * path and by goto when we bail after arming, so the keymap is always put
+	 * back -- including after a caught signal, where this runs from normal
+	 * context rather than the handler.
 	 */
 exit_restore:
-	xtype_restore();
+	for (i = 0; i < map_len; i++)
+		XChangeKeyboardMapping(xdpy, map[i].kc, ks_per_kc,
+		    &keysyms[(map[i].kc - min_kc) * ks_per_kc], 1);
 	XSync(xdpy, False);
 	for (ri = 0; ri < nrsig; ri++)
 		sigaction(rsig[ri], &rold[ri], NULL);
+	if (xtype_interrupted)
+		warnx("xtype interrupted by signal; keymap restored");
 
 	wipe_mem(ks);
 exit_map:

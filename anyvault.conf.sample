@@ -44,6 +44,11 @@ xtype_hotkey: F11
 # prompt.
 xtype_esc: Escape
 
+# Pause, in milliseconds, after each simulated key press and release during
+# 'xtype'. Lower is faster; raise it if a target application drops keys.
+# Valid range is 0 to 1000; the default is 30.
+xtype_delay: 30
+
 # If set to 'no', the program will not use mlock() to ensure allocated
 # memory always remains in RAM. This is insecure if the system isn't
 # encrypting its swap memory.
