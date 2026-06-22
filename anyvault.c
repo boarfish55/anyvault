@@ -74,14 +74,24 @@ volatile sig_atomic_t in_readline = 0;
 
 const char *fields[] = { "notes", "url", "login", "secret", NULL };
 
-/* No valid X keycode is 0 (they run 8..255), so we use it to mean "none". */
-#define NO_KC 0
+int x_error = 0;
+
+/*
+ * Restore context: while xtype() has the live keymap modified, this holds
+ * enough to put it back, so a crash or terminating signal doesn't leave the
+ * user's borrowed keys clobbered. Armed only across the modify/type/restore
+ * window.
+ */
+static Display               *xrc_xdpy;
+static KeySym                *xrc_keysyms;
+static int                    xrc_min_kc, xrc_ks_per_kc, xrc_n;
+static int                    xrc_kc[256];
+static volatile sig_atomic_t  xrc_armed;
 
 struct keymap_ent {
-	wchar_t wc;     /* the character, as decoded by mbstowcs() */
-	KeySym  ks;     /* the keysym we want it to mean */
-	int     kc;     /* scratch keycode, or NO_KC if it uses the fallback */
-	int     n;      /* occurrences of wc in the secret */
+	wchar_t wc;  /* the character, as decoded by mbstowcs() */
+	KeySym  ks;  /* the keysym we want it to mean */
+	int     kc;  /* scratch keycode assigned to it */
 };
 
 void save_db();
@@ -895,17 +905,12 @@ show_secret(json_t *obj, int hide_secret)
 	}
 }
 
-/*
- * TODO: This is a bit flaky, sometimes one of the letters repeats, as
- *       if there is a race of some sort. For example, if a password is
- *       "Password", sometimes the result in the text box ends up being
- *       "PPssword". This never happens in a terminal, always in a browser
- *       window so far.
- */
 int
 x_err_handler(Display *xdpy, XErrorEvent *ev)
 {
 	char buf[1024];
+
+	x_error = 1;
 	XGetErrorText(xdpy, ev->error_code, buf, sizeof(buf));
 	warnx("X error: type=%d, error_code=%d: %s",
 	    ev->type, ev->error_code, buf);
@@ -948,14 +953,45 @@ wchar_to_keysym(wchar_t wc)
 	return (KeySym)wc | 0x01000000UL;
 }
 
-/* Sort keymap_ent's by occurrence count, most frequent first. */
+/* True if keycode kc has no keysym at any level in the snapshot. */
 static int
-by_freq_desc(const void *a, const void *b)
+keycode_empty(const KeySym *keysyms, int kc, int min_kc, int ks_per_kc)
 {
-	const struct keymap_ent *ea = a;
-	const struct keymap_ent *eb = b;
+	int i, base = (kc - min_kc) * ks_per_kc;
 
-	return eb->n - ea->n;
+	for (i = 0; i < ks_per_kc; i++)
+		if (keysyms[base + i] != 0)
+			return 0;
+	return 1;
+}
+
+/* True if keycode kc is bound to a modifier (Shift, Ctrl, AltGr, ...). */
+static int
+is_modifier(XModifierKeymap *mm, int kc)
+{
+	int i;
+
+	if (mm == NULL)
+		return 0;
+	for (i = 0; i < 8 * mm->max_keypermod; i++)
+		if (mm->modifiermap[i] == kc)
+			return 1;
+	return 0;
+}
+
+/*
+ * True if keycode kc's base keysym is an ordinary printable Latin-1 character.
+ * We only borrow such keys: their key type is canonical, so writing the
+ * original symbols back restores them faithfully. Function, keypad, and
+ * multimedia keys (keysyms up in 0xff.. / 0x1008..) may have types or
+ * behaviours that don't round-trip through the core protocol, so we skip them.
+ */
+static int
+ordinary_key(const KeySym *keysyms, int kc, int min_kc, int ks_per_kc)
+{
+	KeySym base = keysyms[(kc - min_kc) * ks_per_kc];
+
+	return (base >= 0x20 && base <= 0x7e) || (base >= 0xa0 && base <= 0xff);
 }
 
 /*
@@ -975,6 +1011,35 @@ fake_tap(Display *xdpy, int kc)
 	usleep(30000);
 }
 
+/*
+ * Put every touched keycode back to its snapshot symbols. Idempotent. Also
+ * called from the signal handler below: that path isn't strictly async-signal
+ * safe (Xlib takes locks), but it's a best-effort last resort before we die
+ * with a clobbered keymap, and the typing loop spends almost all its time in
+ * usleep() rather than inside Xlib.
+ */
+static void
+xtype_restore(void)
+{
+	int i;
+
+	if (!xrc_armed)
+		return;
+	xrc_armed = 0;
+	for (i = 0; i < xrc_n; i++)
+		XChangeKeyboardMapping(xrc_xdpy, xrc_kc[i], xrc_ks_per_kc,
+		    &xrc_keysyms[(xrc_kc[i] - xrc_min_kc) * xrc_ks_per_kc], 1);
+	XFlush(xrc_xdpy);
+}
+
+static void
+xtype_sig_restore(int sig)
+{
+	xtype_restore();
+	signal(sig, SIG_DFL);
+	raise(sig);
+}
+
 void
 xtype(json_t *obj)
 {
@@ -987,15 +1052,19 @@ xtype(json_t *obj)
 	Display            *xdpy;
 	const char         *d = getenv("DISPLAY");
 	int                 min_kc, max_kc, ks_per_kc;
-	int                 k, kc_i, ks_i, kc_empty;
+	int                 kc_i, ks_i;
 	int                 kc_hot, kc_esc, ign_mod;
 	struct keymap_ent  *map = NULL;
-	int                 map_len, i;
-	int                 nfree, npermanent, fallback_kc, need_fallback;
-	int                 free_kc[256]; /* keycodes are CARD8: 8..255 */
+	int                 map_len, i, nscratch;
+	int                 scratch_kc[256]; /* keycodes are CARD8: 8..255 */
+	XModifierKeymap    *modmap;
 	KeySym             *keysyms, *ks = NULL;
 	XEvent              ev;
 	Window              root_w;
+	struct sigaction    rsa, rold[6];
+	int                 rsig[] = { SIGHUP, SIGQUIT, SIGSEGV,
+	                        SIGBUS, SIGABRT, SIGFPE };
+	int                 ri, nrsig = sizeof(rsig) / sizeof(*rsig);
 
 	if (obj == NULL) {
 		printf("secret not found\n");
@@ -1019,6 +1088,7 @@ xtype(json_t *obj)
 	}
 
 	XSetErrorHandler(x_err_handler);
+	x_error = 0;
 
 	if (XStringToKeysym(xtype_hotkey) == 0) {
 		warnx("invalid xtype_hotkey");
@@ -1099,13 +1169,21 @@ xtype(json_t *obj)
 	XSelectInput(xdpy, root_w, 0);
 	XSync(xdpy, False);
 
-	/* Snapshot the current keymap so we can find empty slots. */
+	/*
+	 * Snapshot the current keymap: used both to choose keycodes (empty ones,
+	 * then borrowed real ones) and to restore everything we touch afterwards.
+	 */
 	XDisplayKeycodes(xdpy, &min_kc, &max_kc);
 	keysyms = XGetKeyboardMapping(xdpy, min_kc, max_kc - min_kc + 1,
 	    &ks_per_kc);
 	if (keysyms == NULL) {
 		warnx("XGetKeyboardMapping failed");
 		goto exit_wcs;
+	}
+
+	if (x_error) {
+		warnx("X error occurred; canceling xtype");
+		goto exit_keysyms;
 	}
 
 	/*
@@ -1137,7 +1215,6 @@ xtype(json_t *obj)
 		dup = 0;
 		for (j = 0; j < map_len; j++) {
 			if (map[j].wc == *wp) {
-				map[j].n++;
 				dup = 1;
 				break;
 			}
@@ -1147,8 +1224,6 @@ xtype(json_t *obj)
 
 		map[map_len].wc = *wp;
 		map[map_len].ks = ks_want;
-		map[map_len].kc = NO_KC;
-		map[map_len].n = 1;
 		map_len++;
 	}
 	if (map_len == 0) {
@@ -1157,103 +1232,111 @@ xtype(json_t *obj)
 	}
 
 	/*
-	 * Rank the unique characters by how often they occur, so the ones we
-	 * type most get the scarce permanent scratch keycodes.
+	 * Assign a scratch keycode to each unique character. Prefer empty
+	 * keycodes -- no real key uses them, so reprogramming is free. If the
+	 * secret has more unique characters than there are empty keycodes,
+	 * borrow real keycodes: we snapshotted the whole keymap in `keysyms`, so
+	 * we can put them back exactly afterwards. Only borrow ordinary printable
+	 * keys that aren't modifiers, so we keep Shift/Ctrl/AltGr working and
+	 * don't touch keys whose type wouldn't round-trip on restore.
 	 */
-	qsort(map, map_len, sizeof(*map), by_freq_desc);
+	modmap = XGetModifierMapping(xdpy);
 
-	/*
-	 * Collect the empty keycodes. A keycode is empty when every keysym
-	 * level is 0, i.e. no real key produces anything through it, so
-	 * reprogramming it can't clobber the user's keyboard.
-	 */
-	nfree = 0;
-	for (kc_i = min_kc; kc_i <= max_kc; kc_i++) {
-		kc_empty = 1;
-		for (ks_i = 0; ks_i < ks_per_kc; ks_i++) {
-			k = (kc_i - min_kc) * ks_per_kc + ks_i;
-			if (keysyms[k] != 0) {
-				kc_empty = 0;
-				break;
-			}
-		}
-		if (kc_empty)
-			free_kc[nfree++] = kc_i;
-	}
-	if (nfree == 0) {
-		warnx("no empty keycodes; cannot xtype");
+	nscratch = 0;
+	for (kc_i = min_kc; kc_i <= max_kc && nscratch < map_len; kc_i++)
+		if (keycode_empty(keysyms, kc_i, min_kc, ks_per_kc))
+			scratch_kc[nscratch++] = kc_i;
+	for (kc_i = min_kc; kc_i <= max_kc && nscratch < map_len; kc_i++)
+		if (!keycode_empty(keysyms, kc_i, min_kc, ks_per_kc) &&
+		    !is_modifier(modmap, kc_i) &&
+		    ordinary_key(keysyms, kc_i, min_kc, ks_per_kc))
+			scratch_kc[nscratch++] = kc_i;
+
+	if (modmap != NULL)
+		XFreeModifiermap(modmap);
+
+	if (nscratch < map_len) {
+		warnx("secret needs %d keycodes but only %d are usable; "
+		    "cannot xtype - the secret requires an unusually "
+		    "diverse character set and xtype cannot reuse enough "
+		    "slots in the current keymap", map_len, nscratch);
 		goto exit_map;
 	}
+	for (i = 0; i < map_len; i++)
+		map[i].kc = scratch_kc[i];
 
 	/*
-	 * With at least as many empty keycodes as unique characters, every
-	 * character gets its own permanent slot and we never remap mid-send.
-	 * Otherwise reserve one slot as a rotating fallback and give permanent
-	 * slots to the (nfree - 1) most frequent characters; the rest borrow
-	 * the fallback slot one keystroke at a time. Entries past npermanent
-	 * keep kc == NO_KC from the table build, marking them as fallback users.
-	 */
-	need_fallback = nfree < map_len;
-	npermanent = need_fallback ? nfree - 1 : map_len;
-	for (i = 0; i < npermanent; i++)
-		map[i].kc = free_kc[i];
-	fallback_kc = need_fallback ? free_kc[npermanent] : NO_KC;
-
-	/*
-	 * Program the permanent slots up front, with every group and level set
+	 * Program every scratch keycode up front, with all groups and levels set
 	 * to the same keysym so the active group and modifiers are irrelevant.
-	 * Then sync once: apps that process keymap changes asynchronously can't
-	 * race those remaps against a keypress, since nothing touches a
-	 * permanent slot again until we're done.
+	 * Sync once; nothing remaps during typing, so no keystroke can race a
+	 * half-applied keymap change.
 	 */
 	ks = locked_mem(sizeof(KeySym) * ks_per_kc);
 	if (ks == NULL) {
 		warn("locked_mem");
 		goto exit_map;
 	}
+
+	/*
+	 * Arm the restore context and catch terminating signals before we touch
+	 * the live keymap, so a crash or kill mid-type still puts the borrowed
+	 * keys back. Every path out from here goes through the exit_restore label,
+	 * so the keymap is always put back and the handlers always dropped.
+	 */
+	xrc_xdpy = xdpy;
+	xrc_keysyms = keysyms;
+	xrc_min_kc = min_kc;
+	xrc_ks_per_kc = ks_per_kc;
+	xrc_n = map_len;
+	for (i = 0; i < map_len; i++)
+		xrc_kc[i] = map[i].kc;
+	bzero(&rsa, sizeof(rsa));
+	rsa.sa_handler = xtype_sig_restore;
+	for (ri = 0; ri < nrsig; ri++)
+		sigaction(rsig[ri], &rsa, &rold[ri]);
+	xrc_armed = 1;
+
 	for (i = 0; i < map_len; i++) {
-		if (map[i].kc == NO_KC)
-			continue;
 		for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
 			ks[ks_i] = map[i].ks;
 		XChangeKeyboardMapping(xdpy, map[i].kc, ks_per_kc, ks, 1);
 	}
 	XSync(xdpy, False);
 
+	if (x_error) {
+		warnx("X error occurred; canceling xtype");
+		goto exit_restore;
+	}
+
 	/*
-	 * Play the secret. A character with a permanent slot is just a tap; an
-	 * overflow character (kc == NO_KC) borrows the fallback slot, which is the
-	 * one remaining per-keystroke remap. The server resolves keycode ->
-	 * keysym -> char via the map, so the app receives map[i].wc.
+	 * Play the secret: a plain tap of each character's keycode. The server
+	 * resolves keycode -> keysym -> char via the map, so the app receives
+	 * map[i].wc.
 	 */
 	for (wp = wc_secret; *wp != 0; wp++) {
+		if (timed_out)
+			break;
+
 		for (i = 0; i < map_len; i++)
 			if (map[i].wc == *wp)
 				break;
 		if (i == map_len)
 			continue; /* skipped during table build */
 
-		if (map[i].kc != NO_KC)
-			fake_tap(xdpy, map[i].kc);
-		else {
-			for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
-				ks[ks_i] = map[i].ks;
-			XChangeKeyboardMapping(xdpy, fallback_kc, ks_per_kc,
-			    ks, 1);
-			XSync(xdpy, False);
-			fake_tap(xdpy, fallback_kc);
-		}
+		fake_tap(xdpy, map[i].kc);
 	}
 
-	/* Undo every scratch keycode we touched. */
-	for (ks_i = 0; ks_i < ks_per_kc; ks_i++)
-		ks[ks_i] = 0;
-	for (i = 0; i < map_len; i++)
-		if (map[i].kc != NO_KC)
-			XChangeKeyboardMapping(xdpy, map[i].kc, ks_per_kc, ks, 1);
-	if (fallback_kc != NO_KC)
-		XChangeKeyboardMapping(xdpy, fallback_kc, ks_per_kc, ks, 1);
+	/*
+	 * Restore every keycode we touched to its original symbols (empty rows
+	 * were all-zero, so those clear; borrowed real keys come back), then
+	 * disarm and drop the signal handlers we installed. Reached by fall-through
+	 * on the normal path and by goto when we bail after arming.
+	 */
+exit_restore:
+	xtype_restore();
 	XSync(xdpy, False);
+	for (ri = 0; ri < nrsig; ri++)
+		sigaction(rsig[ri], &rold[ri], NULL);
 
 	wipe_mem(ks);
 exit_map:
